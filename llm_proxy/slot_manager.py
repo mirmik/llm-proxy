@@ -84,8 +84,8 @@ class SlotManager:
         """Save slot KV cache to disk via llama-server API."""
         if model_name in self._no_persistence:
             return
-        url = f"http://127.0.0.1:{port}/slots/{slot_id}"
-        body = {"action": "save", "filename": session_id}
+        url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=save"
+        body = {"filename": session_id}
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -104,8 +104,8 @@ class SlotManager:
         """Restore slot KV cache from disk. Silently skips if unsupported or no saved state."""
         if model_name in self._no_persistence:
             return
-        url = f"http://127.0.0.1:{port}/slots/{slot_id}"
-        body = {"action": "restore", "filename": session_id}
+        url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=restore"
+        body = {"filename": session_id}
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
