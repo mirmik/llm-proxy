@@ -77,10 +77,11 @@ class SlotManager:
 
     async def _save(self, port, slot_id, session_id):
         """Save slot KV cache to disk via llama-server API."""
-        url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=save&filename={session_id}"
+        url = f"http://127.0.0.1:{port}/slots/{slot_id}"
+        body = {"action": "save", "filename": session_id}
         try:
             async with aiohttp.ClientSession() as sess:
-                async with sess.post(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                async with sess.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 200:
                         print(f"  [Slots] Saved slot {slot_id} → {session_id}")
                     else:
@@ -91,10 +92,11 @@ class SlotManager:
 
     async def _restore(self, port, slot_id, session_id):
         """Restore slot KV cache from disk. Silently skips if no saved state."""
-        url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=restore&filename={session_id}"
+        url = f"http://127.0.0.1:{port}/slots/{slot_id}"
+        body = {"action": "restore", "filename": session_id}
         try:
             async with aiohttp.ClientSession() as sess:
-                async with sess.post(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                async with sess.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 200:
                         print(f"  [Slots] Restored slot {slot_id} ← {session_id}")
                     elif resp.status == 400:
