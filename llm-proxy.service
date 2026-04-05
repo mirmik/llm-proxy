@@ -1,0 +1,13 @@
+[Unit]
+Description=LLM Proxy — multi-model orchestrator
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/llm-proxy
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

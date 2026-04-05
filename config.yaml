@@ -3,44 +3,24 @@ listen:
   port: 8090
 
 cache_dir: "~/.cache/llm-proxy/kv"
-llama_server: "~/project/qwen-coder/llama.cpp/build/bin/llama-server"
+llama_server: "/home/mirmik/project/llama.cpp/build_vulkan/bin/llama-server"
 
 models:
   qwen3.5-122b:
     gguf: "~/project/models/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf"
     port: 8081
     slots: 2
-    context: 65536
-    extra_args: "--rpc 192.168.0.61:50052 --tensor-split 28,16 --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 -b 4096 -ub 4096"
+    context: 131072
+    extra_args: "--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 -b 4096 -ub 4096"
     autoload: true
-    gpu: cluster
 
   qwen3.5-35b-a3b:
     gguf: "~/project/models/Qwen3.5-35B-A3B-Q4_K_M.gguf"
     port: 8082
     slots: 1
-    context: 32768
+    context: 131072
     extra_args: "--flash-attn on"
     autoload: false
-    gpu: local
-
-  qwen3-4b:
-    gguf: "~/project/models/Qwen3-4B-Q8_0.gguf"
-    port: 8083
-    slots: 1
-    context: 32768
-    extra_args: "--flash-attn on"
-    autoload: false
-    gpu: local
-
-  qwen3-1.7b:
-    gguf: "~/project/models/Qwen3-1.7B-Q8_0.gguf"
-    port: 8084
-    slots: 1
-    context: 32768
-    extra_args: "--flash-attn on"
-    autoload: false
-    gpu: local
 
 gpu_groups:
   local: 32768   # MB VRAM on 5090
