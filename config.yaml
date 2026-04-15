@@ -49,7 +49,7 @@ runtimes:
     default_profile: "ru-large"
     profiles:
       ru-large:
-        python_bin: "python3"
+        venv: "~/project/voice-input/.venv"
         port: 5055
         model_size: "large-v3"
         language: "ru"
@@ -64,7 +64,7 @@ runtimes:
     default_profile: "mirmik"
     profiles:
       mirmik:
-        python_bin: "~/project/for-tts-xtts/.venv311/bin/python"
+        venv: "~/project/for-tts-xtts/.venv311"
         port: 5050
         model_name: "tts_models/multilingual/multi-dataset/xtts_v2"
         reference_wav: "~/project/for-tts-xtts/reference.wav"

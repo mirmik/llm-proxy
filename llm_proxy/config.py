@@ -97,5 +97,5 @@ def _expand_runtime_paths(profile):
     for key, value in list(profile.items()):
         if not isinstance(value, str):
             continue
-        if key in {"gguf", "reference_wav", "python_bin", "workdir"}:
+        if key in {"gguf", "reference_wav", "python_bin", "workdir", "venv"}:
             profile[key] = os.path.expanduser(value)

@@ -76,10 +76,18 @@ async def handle_chat(request):
     if err:
         return err
 
-    try:
-        port = await rm.ensure(model_name)
-    except Exception as e:
-        return web.json_response({"error": f"Failed to start {model_name}: {e}"}, status=503)
+    if not rm.is_running(model_name):
+        return web.json_response(
+            {"error": f"Model '{model_name}' is not loaded. Load it explicitly via control API or web UI."},
+            status=503,
+        )
+
+    port = rm.get_port(model_name)
+    if not port:
+        return web.json_response(
+            {"error": f"Model '{model_name}' is marked running but has no bound port."},
+            status=503,
+        )
 
     slot_id = await _ensure_slot(rm, sm, model_name, session_id, port)
     if slot_id is not None:

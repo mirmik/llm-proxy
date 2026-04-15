@@ -1,9 +1,9 @@
 """XTTS runtime driver."""
 
 import os
-import sys
 
 from llm_proxy.drivers.base import RuntimeDriver
+from llm_proxy.drivers.utils import resolve_python_bin
 
 
 class XTTSDriver(RuntimeDriver):
@@ -19,7 +19,7 @@ class XTTSDriver(RuntimeDriver):
             raise ValueError("xtts profile requires 'reference_wav'")
 
     def build_command(self, runtime_name, profile, global_config):
-        python_bin = profile.get("python_bin") or sys.executable
+        python_bin = resolve_python_bin(profile)
         script = os.path.join(os.path.dirname(os.path.dirname(__file__)), "runners", "xtts_server.py")
         return [python_bin, script]
 
@@ -49,4 +49,5 @@ class XTTSDriver(RuntimeDriver):
             "reference_wav": os.path.expanduser(str(profile["reference_wav"])),
             "language": profile.get("language"),
             "gpu": profile.get("gpu"),
+            "python_bin": resolve_python_bin(profile),
         }

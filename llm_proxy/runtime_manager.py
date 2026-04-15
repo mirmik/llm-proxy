@@ -126,9 +126,6 @@ class RuntimeManager:
         profile = self.resolve_profile(runtime_name)
         driver.validate_profile(profile)
 
-        if self.coordinator:
-            await self.coordinator.prepare("runtime", runtime_name, profile.get("gpu"))
-
         argv = driver.build_command(runtime_name, profile, self.config)
         env = os.environ.copy()
         env.update(driver.build_env(runtime_name, profile, self.config))

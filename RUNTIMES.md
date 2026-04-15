@@ -39,6 +39,21 @@ Each driver provides:
 - `startup_timeout(runtime_name, profile)`
 - `runtime_meta(runtime_name, profile, global_config)`
 
+## Python Environments
+
+Runtime profiles may specify either:
+
+- `python_bin`
+- `venv`
+
+If `venv` is set, `llm-proxy` resolves the interpreter as:
+
+```text
+<venv>/bin/python
+```
+
+This allows STT, TTS, diffusion, and other runtimes to use different PyTorch builds while still being started and supervised directly by `llm-proxy`.
+
 ## Next Step
 
 The next concrete step is to add:

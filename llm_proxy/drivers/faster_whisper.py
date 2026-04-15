@@ -1,9 +1,9 @@
 """faster-whisper runtime driver."""
 
 import os
-import sys
 
 from llm_proxy.drivers.base import RuntimeDriver
+from llm_proxy.drivers.utils import resolve_python_bin
 
 
 class FasterWhisperDriver(RuntimeDriver):
@@ -19,7 +19,7 @@ class FasterWhisperDriver(RuntimeDriver):
             raise ValueError("faster_whisper profile requires 'model_size'")
 
     def build_command(self, runtime_name, profile, global_config):
-        python_bin = profile.get("python_bin") or sys.executable
+        python_bin = resolve_python_bin(profile)
         script = os.path.join(os.path.dirname(os.path.dirname(__file__)), "runners", "faster_whisper_server.py")
         return [python_bin, script]
 
@@ -48,4 +48,5 @@ class FasterWhisperDriver(RuntimeDriver):
             "model_size": profile["model_size"],
             "language": profile.get("language"),
             "gpu": profile.get("gpu"),
+            "python_bin": resolve_python_bin(profile),
         }
