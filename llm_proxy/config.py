@@ -37,6 +37,7 @@ def load_config(path=None):
                 break
 
     config = dict(DEFAULT_CONFIG)
+    config["_config_path"] = os.path.expanduser(path) if path else None
     if path and os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as f:
             user = yaml.safe_load(f) or {}
@@ -70,6 +71,23 @@ def load_config(path=None):
         _expand_service_paths(svc)
 
     return config
+
+
+def load_config_file(path):
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def save_config_file(path, payload):
+    path = os.path.expanduser(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=False)
+    os.replace(tmp, path)
 
 
 def _deep_update(base, override):

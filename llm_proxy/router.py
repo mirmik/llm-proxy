@@ -21,6 +21,7 @@ def create_app(runtime_manager, slot_manager, auth_manager=None):
     app.router.add_post("/v1/control/runtimes/{name}/start", handle_runtime_start)
     app.router.add_post("/v1/control/runtimes/{name}/stop", handle_runtime_stop)
     app.router.add_post("/v1/control/runtimes/{name}/select-profile", handle_runtime_select_profile)
+    app.router.add_post("/v1/control/runtimes/{name}/settings", handle_runtime_settings)
     app.router.add_get("/v1/control/runtimes/{name}/logs", handle_runtime_logs)
     app.router.add_get("/v1/control/state", handle_control_state)
     app.router.add_post("/v1/control/models/{name}/load", handle_load)
@@ -298,6 +299,24 @@ async def handle_runtime_logs(request):
     return web.json_response({"runtime": name, "logs": rm.get_logs(name)})
 
 
+async def handle_runtime_settings(request):
+    """POST /v1/control/runtimes/{name}/settings."""
+    _require_control_auth(request)
+    rm = request.app["rm"]
+    name = request.match_info["name"]
+    body = await request.json()
+    settings = body.get("settings")
+    if not isinstance(settings, dict):
+        return web.json_response({"error": "settings object is required"}, status=400)
+    try:
+        await rm.update_settings(name, settings)
+        return web.json_response({"ok": True, "runtime": rm.runtime_state(name)})
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
 async def handle_panel(request):
     """Simple built-in control panel."""
     return web.Response(text=_panel_html(), content_type="text/html")
@@ -416,6 +435,15 @@ def _panel_html():
       grid-template-columns: repeat(3, 1fr);
       gap: 8px;
       margin-top: 12px;
+    }
+    .settings-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .settings-grid .full {
+      grid-column: 1 / -1;
     }
     .meta {
       color: var(--muted);
@@ -543,6 +571,7 @@ def _panel_html():
       const llmAction = runtime.kind === 'llm'
         ? `<button data-action="${running ? 'unload-model' : 'load-model'}" data-name="${escapeHtml(runtime.name)}">${running ? 'Unload' : 'Load'}</button>`
         : `<button disabled>${escapeHtml(runtime.kind)}</button>`;
+      const settings = runtime.settings || {};
       return `<article class="card">
         <div class="toolbar">
           <strong>${escapeHtml(runtime.name)}</strong>
@@ -566,6 +595,38 @@ def _panel_html():
           <button class="warning" data-action="stop-runtime" data-name="${escapeHtml(runtime.name)}">Stop</button>
           ${llmAction}
         </div>
+        <div class="settings-grid">
+          <div>
+            <label>Autoload</label>
+            <select data-setting="autoload" data-name="${escapeHtml(runtime.name)}">
+              <option value="true" ${settings.autoload ? 'selected' : ''}>true</option>
+              <option value="false" ${!settings.autoload ? 'selected' : ''}>false</option>
+            </select>
+          </div>
+          <div>
+            <label>Port</label>
+            <input data-setting="port" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.port ?? '')}">
+          </div>
+          <div>
+            <label>Context</label>
+            <input data-setting="context" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.context ?? '')}">
+          </div>
+          <div>
+            <label>Slots</label>
+            <input data-setting="slots" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.slots ?? '')}">
+          </div>
+          <div>
+            <label>Language</label>
+            <input data-setting="language" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.language ?? '')}">
+          </div>
+          <div>
+            <label>Model Size</label>
+            <input data-setting="model_size" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.model_size ?? '')}">
+          </div>
+          <div class="full">
+            <button class="secondary" data-action="save-settings" data-name="${escapeHtml(runtime.name)}">Save Settings</button>
+          </div>
+        </div>
         <button style="margin-top:10px;background:#44403c;" data-action="logs-runtime" data-name="${escapeHtml(runtime.name)}">Show Logs</button>
         <pre id="logs-${escapeHtml(runtime.name)}" hidden></pre>
       </article>`;
@@ -586,6 +647,22 @@ def _panel_html():
       const pre = document.getElementById('logs-' + name);
       pre.hidden = false;
       pre.textContent = (data.logs || []).join('\\n');
+    }
+
+    async function saveSettings(name) {
+      const fields = document.querySelectorAll(`[data-setting][data-name="${CSS.escape(name)}"]`);
+      const settings = {};
+      for (const field of fields) {
+        let value = field.value;
+        if (field.dataset.setting === 'autoload') {
+          value = value === 'true';
+        }
+        settings[field.dataset.setting] = value;
+      }
+      await api('/v1/control/runtimes/' + encodeURIComponent(name) + '/settings', {
+        method: 'POST',
+        body: JSON.stringify({settings}),
+      });
     }
 
     function escapeHtml(value) {
@@ -617,6 +694,8 @@ def _panel_html():
         } else if (action === 'logs-runtime') {
           await showLogs(name);
           return;
+        } else if (action === 'save-settings') {
+          await saveSettings(name);
         }
         await refreshState();
       } catch (e) {

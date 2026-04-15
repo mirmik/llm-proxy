@@ -9,6 +9,7 @@ from collections import deque
 
 import aiohttp
 
+from llm_proxy.config import load_config, load_config_file, save_config_file
 from llm_proxy.drivers import build_driver_registry
 
 
@@ -87,6 +88,7 @@ class RuntimeManager:
             "gpu": profile.get("gpu"),
             "health_url": driver.resolve_health_url(runtime_name, profile, self.config),
             "pid": self._processes.get(runtime_name).pid if self.is_running(runtime_name) else None,
+            "settings": self._editable_settings(runtime_name),
             **meta,
         }
 
@@ -195,6 +197,49 @@ class RuntimeManager:
             await self.stop(runtime_name)
             await self.start(runtime_name)
 
+    async def update_settings(self, runtime_name, settings):
+        runtime = self.runtimes.get(runtime_name)
+        if not runtime:
+            raise ValueError(f"Unknown runtime: {runtime_name}")
+
+        config_path = self.config.get("_config_path")
+        if not config_path:
+            raise ValueError("No writable config path is associated with the running server")
+
+        current_profile = self.current_profile(runtime_name)
+        if not current_profile:
+            raise ValueError(f"Runtime {runtime_name} has no active profile")
+
+        raw = load_config_file(config_path)
+        runtimes = raw.setdefault("runtimes", {})
+        raw_runtime = runtimes.get(runtime_name)
+        if not raw_runtime:
+            raise ValueError(f"Runtime {runtime_name} is missing from config file")
+        raw_profiles = raw_runtime.setdefault("profiles", {})
+        raw_profile = raw_profiles.setdefault(current_profile, {})
+
+        if "autoload" in settings:
+            raw_runtime["autoload"] = bool(settings["autoload"])
+
+        for key, value in settings.items():
+            if key == "autoload":
+                continue
+            if value in ("", None):
+                raw_profile.pop(key, None)
+                continue
+            if key in {"port", "context", "slots", "sample_rate"}:
+                raw_profile[key] = int(value)
+            else:
+                raw_profile[key] = value
+
+        save_config_file(config_path, raw)
+        running = self.is_running(runtime_name)
+        if running:
+            await self.stop(runtime_name)
+        self._reload_from_disk()
+        if running:
+            await self.start(runtime_name)
+
     def resolve_profile(self, runtime_name):
         runtime = self.runtimes[runtime_name]
         profile_name = self.current_profile(runtime_name)
@@ -205,6 +250,23 @@ class RuntimeManager:
         if "gpu" not in merged and runtime.get("gpu"):
             merged["gpu"] = runtime["gpu"]
         return merged
+
+    def _editable_settings(self, runtime_name):
+        runtime = self.runtimes[runtime_name]
+        profile = self.resolve_profile(runtime_name)
+        current_profile = self.current_profile(runtime_name)
+        return {
+            "autoload": bool(runtime.get("autoload", False)),
+            "profile_name": current_profile,
+            "port": profile.get("port"),
+            "context": profile.get("context"),
+            "slots": profile.get("slots"),
+            "model_size": profile.get("model_size"),
+            "language": profile.get("language"),
+            "venv": profile.get("venv"),
+            "python_bin": profile.get("python_bin"),
+            "reference_wav": profile.get("reference_wav"),
+        }
 
     def _build_runtimes(self, config):
         runtimes = copy.deepcopy(config.get("runtimes") or {})
@@ -223,6 +285,12 @@ class RuntimeManager:
                 },
             }
         return runtimes
+
+    def _reload_from_disk(self):
+        config_path = self.config.get("_config_path")
+        reloaded = load_config(config_path)
+        self.config = reloaded
+        self.runtimes = self._build_runtimes(reloaded)
 
     def _load_state(self):
         if not os.path.isfile(self._state_path):
