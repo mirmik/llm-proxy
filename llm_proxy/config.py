@@ -18,6 +18,12 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "bootstrap_password": None,
     },
+    "web_auth": {
+        "enabled": False,
+        "session_ttl_hours": 168,
+        "secure_cookies": False,
+        "users": [],
+    },
     "runtimes": {},
     "models": {},
     "services": {},

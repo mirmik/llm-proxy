@@ -18,6 +18,10 @@ class AuthManager:
         self.enabled = bool(((config.get("auth") or {}).get("enabled", False)))
         self.state_dir = os.path.expanduser(config["state_dir"])
         self.auth_cfg = config.get("auth") or {}
+        self.web_auth_cfg = config.get("web_auth") or {}
+        self.web_enabled = bool(self.web_auth_cfg.get("enabled", False))
+        self._sessions = {}
+        self._session_cookie = "llm_proxy_session"
 
     def create_invite(self, host_id, ttl_hours=24.0):
         invites = self._load_json(self._invites_path())
@@ -69,8 +73,68 @@ class AuthManager:
         return {"host_id": host_id, "token": auth_token}
 
     def require_control(self, request):
+        web_user = self.get_web_user(request)
+        if web_user:
+            return web_user
         if not self.enabled:
             return None
+        return self._require_host_token(request)
+
+    def require_client(self, request):
+        if not self.enabled:
+            return None
+        return self._require_host_token(request)
+
+    def get_web_user(self, request):
+        if not self.web_enabled:
+            return None
+        session_id = request.cookies.get(self._session_cookie)
+        if not session_id:
+            return None
+        session = self._sessions.get(session_id)
+        if not session:
+            return None
+        expires_at = session.get("expires_at")
+        if expires_at and datetime.now(timezone.utc) >= datetime.fromisoformat(expires_at):
+            self._sessions.pop(session_id, None)
+            return None
+        return session.get("username")
+
+    def web_login(self, username, password):
+        username = (username or "").strip()
+        password = password or ""
+        if not username or not password:
+            raise PermissionError("username and password are required")
+        user = None
+        for candidate in self.web_auth_cfg.get("users", []):
+            if candidate.get("username") == username:
+                user = candidate
+                break
+        if not user:
+            raise PermissionError("invalid username or password")
+        if not self._verify_web_password(user, password):
+            raise PermissionError("invalid username or password")
+        session_id = self._generate_token(48)
+        ttl_hours = float(self.web_auth_cfg.get("session_ttl_hours", 168))
+        self._sessions[session_id] = {
+            "username": username,
+            "created_at": self._now(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat(),
+        }
+        return session_id
+
+    def web_logout(self, request):
+        session_id = request.cookies.get(self._session_cookie)
+        if session_id:
+            self._sessions.pop(session_id, None)
+
+    def session_cookie_name(self):
+        return self._session_cookie
+
+    def secure_cookies(self):
+        return bool(self.web_auth_cfg.get("secure_cookies", False))
+
+    def _require_host_token(self, request):
         auth_header = request.headers.get("Authorization", "")
         host_id = (request.headers.get("X-LLM-Proxy-Host-ID") or "").strip()
         token = ""
@@ -149,6 +213,20 @@ class AuthManager:
         salt = base64.b64decode(payload["salt"])
         expected = base64.b64decode(payload["password_hash"])
         iterations = int(payload.get("iterations", 600_000))
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return secrets.compare_digest(actual, expected)
+
+    def _verify_web_password(self, user, password):
+        plain = user.get("password")
+        if plain is not None:
+            return secrets.compare_digest(str(plain), password)
+        salt_b64 = user.get("salt")
+        password_hash_b64 = user.get("password_hash")
+        if not salt_b64 or not password_hash_b64:
+            return False
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(password_hash_b64)
+        iterations = int(user.get("iterations", 600_000))
         actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
         return secrets.compare_digest(actual, expected)
 

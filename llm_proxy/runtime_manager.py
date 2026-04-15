@@ -35,6 +35,9 @@ class RuntimeManager:
     def available_models(self):
         return [name for name, rt in self.runtimes.items() if self.driver_for(name).kind() == "llm"]
 
+    def runtimes_by_kind(self, kind):
+        return [name for name in self.available_runtimes() if self.driver_for(name).kind() == kind]
+
     def loaded_runtimes(self):
         return [name for name in self.available_runtimes() if self.is_running(name)]
 
