@@ -3,24 +3,75 @@ listen:
   port: 8090
 
 cache_dir: "~/.cache/llm-proxy/kv"
+state_dir: "~/.config/llm-proxy"
 llama_server: "/home/mirmik/project/llama.cpp/build_vulkan/bin/llama-server"
 
-models:
+tls:
+  enabled: false
+  cert_file: "~/.config/llm-proxy/certs/server.crt"
+  key_file: "~/.config/llm-proxy/certs/server.key"
+
+auth:
+  enabled: false
+  bootstrap_password: null
+
+runtimes:
   qwen3.5-122b:
-    gguf: "~/project/models/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf"
-    port: 8081
-    slots: 2
-    context: 131072
-    extra_args: "--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 -b 4096 -ub 4096"
+    driver: "llama_cpp"
+    gpu: "local"
     autoload: true
+    default_profile: "default"
+    profiles:
+      default:
+        gguf: "~/project/models/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf"
+        port: 8081
+        slots: 2
+        context: 131072
+        extra_args: "--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 -b 4096 -ub 4096"
 
   qwen3.5-35b-a3b:
-    gguf: "~/project/models/Qwen3.5-35B-A3B-Q4_K_M.gguf"
-    port: 8082
-    slots: 1
-    context: 131072
-    extra_args: "--flash-attn on"
+    driver: "llama_cpp"
+    gpu: "local"
     autoload: false
+    default_profile: "default"
+    profiles:
+      default:
+        gguf: "~/project/models/Qwen3.5-35B-A3B-Q4_K_M.gguf"
+        port: 8082
+        slots: 1
+        context: 131072
+        extra_args: "--flash-attn on"
+
+  stt-main:
+    driver: "faster_whisper"
+    gpu: "local"
+    autoload: false
+    default_profile: "ru-large"
+    profiles:
+      ru-large:
+        python_bin: "python3"
+        port: 5055
+        model_size: "large-v3"
+        language: "ru"
+        device: "cuda"
+        compute_type: "float16"
+        sample_rate: 16000
+
+  tts-main:
+    driver: "xtts"
+    gpu: "local"
+    autoload: false
+    default_profile: "mirmik"
+    profiles:
+      mirmik:
+        python_bin: "~/project/for-tts-xtts/.venv311/bin/python"
+        port: 5050
+        model_name: "tts_models/multilingual/multi-dataset/xtts_v2"
+        reference_wav: "~/project/for-tts-xtts/reference.wav"
+        language: "ru"
+        device: "cuda"
+        sample_rate: 24000
+        coqui_tos_agreed: "1"
 
 gpu_groups:
   local: 32768   # MB VRAM on 5090

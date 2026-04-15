@@ -11,11 +11,12 @@ import aiohttp
 class ProcessManager:
     """Manages llama-server processes, one per model."""
 
-    def __init__(self, config):
+    def __init__(self, config, coordinator=None):
         self.config = config
         self.llama_bin = config["llama_server"]
         self.models = config["models"]
         self.gpu_groups = config.get("gpu_groups", {})
+        self.coordinator = coordinator
         self._processes = {}  # model_name → asyncio.subprocess.Process
         self._ports = {}      # model_name → port
 
@@ -32,6 +33,13 @@ class ProcessManager:
     def available_models(self):
         return list(self.models.keys())
 
+    def list_running_on_gpu(self, gpu):
+        running = []
+        for name, cfg in self.models.items():
+            if self.is_running(name) and cfg.get("gpu") == gpu:
+                running.append(name)
+        return running
+
     async def start(self, model_name):
         """Start llama-server for the given model. Returns when server is healthy."""
         if self.is_running(model_name):
@@ -44,12 +52,13 @@ class ProcessManager:
 
         # Handle GPU conflicts — stop models sharing the same GPU group
         gpu = mcfg.get("gpu")
-        if gpu:
+        if self.coordinator:
+            await self.coordinator.prepare("model", model_name, gpu)
+        elif gpu:
             for other_name, other_cfg in self.models.items():
-                if other_name != model_name and other_cfg.get("gpu") == gpu:
-                    if self.is_running(other_name):
-                        print(f"  [PM] Stopping {other_name} (GPU conflict: {gpu})")
-                        await self.stop(other_name)
+                if other_name != model_name and other_cfg.get("gpu") == gpu and self.is_running(other_name):
+                    print(f"  [PM] Stopping {other_name} (GPU conflict: {gpu})")
+                    await self.stop(other_name)
 
         port = mcfg.get("port", 8081)
         slots = mcfg.get("slots", 1)
