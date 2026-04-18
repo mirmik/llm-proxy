@@ -1,14 +1,14 @@
 """Configuration loader."""
 
 import os
+
 import yaml
 
 
 DEFAULT_CONFIG = {
     "listen": {"host": "0.0.0.0", "port": 8090},
-    "cache_dir": "~/.cache/llm-proxy/kv",
+    "cache_dir": "~/.cache/llm-proxy",
     "state_dir": "~/.config/llm-proxy",
-    "llama_server": "llama-server",
     "tls": {
         "enabled": False,
         "cert_file": "~/.config/llm-proxy/certs/server.crt",
@@ -24,10 +24,8 @@ DEFAULT_CONFIG = {
         "secure_cookies": False,
         "users": [],
     },
+    "defaults": {},
     "runtimes": {},
-    "models": {},
-    "services": {},
-    "gpu_groups": {},
 }
 
 
@@ -54,27 +52,24 @@ def load_config(path=None):
 
     config["cache_dir"] = os.path.expanduser(config["cache_dir"])
     config["state_dir"] = os.path.expanduser(config["state_dir"])
-    config["llama_server"] = os.path.expanduser(config["llama_server"])
+
     tls_cfg = config.get("tls") or {}
     if "cert_file" in tls_cfg:
         tls_cfg["cert_file"] = os.path.expanduser(tls_cfg["cert_file"])
     if "key_file" in tls_cfg:
         tls_cfg["key_file"] = os.path.expanduser(tls_cfg["key_file"])
 
-    # Expand paths in model definitions
-    for name, m in config["models"].items():
-        if "gguf" in m:
-            m["gguf"] = os.path.expanduser(m["gguf"])
+    defaults = config.get("defaults") or {}
+    for key, value in list(defaults.items()):
+        if isinstance(value, str):
+            defaults[key] = os.path.expanduser(value)
 
-    for _, runtime in config.get("runtimes", {}).items():
+    for name, runtime in (config.get("runtimes") or {}).items():
+        _validate_runtime(name, runtime)
         base = runtime.get("base") or {}
-        _expand_runtime_paths(base)
-        profiles = runtime.get("profiles") or {}
-        for _, profile in profiles.items():
-            _expand_runtime_paths(profile)
-
-    for _, svc in config.get("services", {}).items():
-        _expand_service_paths(svc)
+        _expand_profile_paths(base)
+        for _, profile in (runtime.get("profiles") or {}).items():
+            _expand_profile_paths(profile)
 
     return config
 
@@ -96,6 +91,20 @@ def save_config_file(path, payload):
     os.replace(tmp, path)
 
 
+def _validate_runtime(name, runtime):
+    if not runtime.get("driver"):
+        raise ValueError(f"Runtime '{name}' is missing 'driver'")
+    profiles = runtime.get("profiles") or {}
+    if not profiles:
+        raise ValueError(f"Runtime '{name}' has no profiles")
+    default_profile = runtime.get("default_profile")
+    if default_profile and default_profile not in profiles:
+        raise ValueError(
+            f"Runtime '{name}' default_profile='{default_profile}' "
+            f"not in profiles {list(profiles)}"
+        )
+
+
 def _deep_update(base, override):
     for k, v in override.items():
         if isinstance(v, dict) and isinstance(base.get(k), dict):
@@ -104,22 +113,9 @@ def _deep_update(base, override):
             base[k] = v
 
 
-def _expand_service_paths(service):
-    for key in ("workdir", "health_url"):
-        if key in service and isinstance(service[key], str) and key == "workdir":
-            service[key] = os.path.expanduser(service[key])
-    env = service.get("env") or {}
-    for key, value in list(env.items()):
-        if isinstance(value, str) and ("/" in value or value.startswith("~")):
-            env[key] = os.path.expanduser(value)
-    profiles = service.get("profiles") or {}
-    for _, profile in profiles.items():
-        _expand_service_paths(profile)
-
-
-def _expand_runtime_paths(profile):
+def _expand_profile_paths(profile):
     for key, value in list(profile.items()):
         if not isinstance(value, str):
             continue
-        if key in {"gguf", "reference_wav", "python_bin", "workdir", "venv"}:
+        if key in {"reference_wav", "python_bin", "workdir", "venv"}:
             profile[key] = os.path.expanduser(value)

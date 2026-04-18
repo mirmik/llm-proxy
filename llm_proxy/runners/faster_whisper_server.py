@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
-"""Managed faster-whisper HTTP server for llm-proxy."""
+"""Managed faster-whisper HTTP server for llm-proxy.
 
+Parameters are taken from CLI flags first, env vars as fallback.
+CLI flags (each has a matching LLM_PROXY_FW_* env var):
+    --host                   (LLM_PROXY_FW_HOST,         default 0.0.0.0)
+    --port                   (LLM_PROXY_FW_PORT,         default 5055)
+    --model-size             (LLM_PROXY_FW_MODEL_SIZE,   default large-v3)
+    --device                 (LLM_PROXY_FW_DEVICE,       default cuda)
+    --compute-type           (LLM_PROXY_FW_COMPUTE_TYPE, default float16)
+    --sample-rate            (LLM_PROXY_FW_SAMPLE_RATE,  default 16000)
+    --language               (LLM_PROXY_FW_LANGUAGE,     optional)
+    --token                  (LLM_PROXY_FW_TOKEN,        optional bearer)
+"""
+
+import argparse
 import os
 
 import numpy as np
@@ -8,75 +21,84 @@ from aiohttp import web
 from faster_whisper import WhisperModel
 
 
-HOST = "127.0.0.1"
-PORT = int(os.environ.get("LLM_PROXY_FW_PORT", "5055"))
-MODEL_SIZE = os.environ.get("LLM_PROXY_FW_MODEL_SIZE", "large-v3")
-DEVICE = os.environ.get("LLM_PROXY_FW_DEVICE", "cuda")
-COMPUTE_TYPE = os.environ.get("LLM_PROXY_FW_COMPUTE_TYPE", "float16")
-SAMPLE_RATE = int(os.environ.get("LLM_PROXY_FW_SAMPLE_RATE", "16000"))
-LANGUAGE = os.environ.get("LLM_PROXY_FW_LANGUAGE") or None
-TOKEN = os.environ.get("LLM_PROXY_FW_TOKEN") or None
+def _env_or(name, default=None):
+    value = os.environ.get(name)
+    return value if value is not None and value != "" else default
 
 
-print(f"[faster-whisper] Loading model={MODEL_SIZE} device={DEVICE} compute={COMPUTE_TYPE}")
-MODEL = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-print("[faster-whisper] Ready")
+def parse_args():
+    p = argparse.ArgumentParser(description="faster-whisper HTTP server")
+    p.add_argument("--host", default=_env_or("LLM_PROXY_FW_HOST", "0.0.0.0"))
+    p.add_argument("--port", type=int, default=int(_env_or("LLM_PROXY_FW_PORT", "5055")))
+    p.add_argument("--model-size", default=_env_or("LLM_PROXY_FW_MODEL_SIZE", "large-v3"))
+    p.add_argument("--device", default=_env_or("LLM_PROXY_FW_DEVICE", "cuda"))
+    p.add_argument("--compute-type", default=_env_or("LLM_PROXY_FW_COMPUTE_TYPE", "float16"))
+    p.add_argument("--sample-rate", type=int, default=int(_env_or("LLM_PROXY_FW_SAMPLE_RATE", "16000")))
+    p.add_argument("--language", default=_env_or("LLM_PROXY_FW_LANGUAGE"))
+    p.add_argument("--token", default=_env_or("LLM_PROXY_FW_TOKEN"))
+    return p.parse_args()
 
 
-def _check_auth(request):
-    if not TOKEN:
-        return True
-    header = request.headers.get("Authorization", "")
-    return header.removeprefix("Bearer ").strip() == TOKEN
+def build_app(args, model):
+    def check_auth(request):
+        if not args.token:
+            return True
+        header = request.headers.get("Authorization", "")
+        return header.removeprefix("Bearer ").strip() == args.token
 
+    async def handle_stt(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
 
-async def handle_stt(request):
-    if not _check_auth(request):
-        return web.json_response({"error": "unauthorized"}, status=401)
+        if request.content_type and request.content_type.startswith("multipart/"):
+            data = await request.post()
+            if "audio" not in data:
+                return web.json_response({"error": "missing audio file"}, status=400)
+            raw = data["audio"].file.read()
+            audio = np.frombuffer(raw, dtype=np.float32)
+        else:
+            raw = await request.read()
+            audio = np.frombuffer(raw, dtype=np.float32)
 
-    if request.content_type and request.content_type.startswith("multipart/"):
-        data = await request.post()
-        if "audio" not in data:
-            return web.json_response({"error": "missing audio file"}, status=400)
-        raw = data["audio"].file.read()
-        audio = np.frombuffer(raw, dtype=np.float32)
-    else:
-        raw = await request.read()
-        audio = np.frombuffer(raw, dtype=np.float32)
+        duration = len(audio) / args.sample_rate if args.sample_rate else 0.0
+        if duration < 0.3:
+            return web.json_response({"text": "", "duration": duration})
 
-    duration = len(audio) / SAMPLE_RATE if SAMPLE_RATE else 0.0
-    if duration < 0.3:
-        return web.json_response({"text": "", "duration": duration})
+        prompt = request.query.get("prompt", "") or request.headers.get("X-Initial-Prompt", "")
+        segments, info = model.transcribe(
+            audio,
+            language=args.language,
+            beam_size=5,
+            initial_prompt=prompt or None,
+        )
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+        return web.json_response({
+            "text": text,
+            "duration": duration,
+            "language": info.language,
+        })
 
-    prompt = request.query.get("prompt", "") or request.headers.get("X-Initial-Prompt", "")
-    segments, info = MODEL.transcribe(
-        audio,
-        language=LANGUAGE,
-        beam_size=5,
-        initial_prompt=prompt or None,
-    )
-    text = " ".join(segment.text.strip() for segment in segments).strip()
-    return web.json_response({
-        "text": text,
-        "duration": duration,
-        "language": info.language,
-    })
+    async def handle_health(request):
+        return web.json_response({
+            "status": "ok",
+            "kind": "stt",
+            "model_size": args.model_size,
+            "language": args.language,
+        })
 
-
-async def handle_health(request):
-    return web.json_response({
-        "status": "ok",
-        "kind": "stt",
-        "model_size": MODEL_SIZE,
-        "language": LANGUAGE,
-    })
-
-
-def main():
     app = web.Application(client_max_size=64 * 1024 * 1024)
     app.router.add_post("/stt", handle_stt)
     app.router.add_get("/health", handle_health)
-    web.run_app(app, host=HOST, port=PORT, handle_signals=True)
+    return app
+
+
+def main():
+    args = parse_args()
+    print(f"[faster-whisper] Loading model={args.model_size} device={args.device} compute={args.compute_type}")
+    model = WhisperModel(args.model_size, device=args.device, compute_type=args.compute_type)
+    print("[faster-whisper] Ready")
+    app = build_app(args, model)
+    web.run_app(app, host=args.host, port=args.port, handle_signals=True)
 
 
 if __name__ == "__main__":

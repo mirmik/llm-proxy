@@ -227,11 +227,20 @@ class RuntimeManager:
         for key, value in settings.items():
             if key == "autoload":
                 continue
+            if key == "env":
+                env_dict = _parse_env(value)
+                if env_dict:
+                    raw_profile["env"] = env_dict
+                else:
+                    raw_profile.pop("env", None)
+                continue
             if value in ("", None):
                 raw_profile.pop(key, None)
                 continue
-            if key in {"port", "context", "slots", "sample_rate"}:
+            if key in {"port", "slots", "sample_rate"}:
                 raw_profile[key] = int(value)
+            elif key == "startup_timeout":
+                raw_profile[key] = float(value)
             else:
                 raw_profile[key] = value
 
@@ -256,38 +265,24 @@ class RuntimeManager:
 
     def _editable_settings(self, runtime_name):
         runtime = self.runtimes[runtime_name]
+        driver = self.driver_for(runtime_name)
         profile = self.resolve_profile(runtime_name)
         current_profile = self.current_profile(runtime_name)
         return {
             "autoload": bool(runtime.get("autoload", False)),
             "profile_name": current_profile,
+            "kind": driver.kind(),
             "port": profile.get("port"),
-            "context": profile.get("context"),
             "slots": profile.get("slots"),
-            "model_size": profile.get("model_size"),
-            "language": profile.get("language"),
             "venv": profile.get("venv"),
             "python_bin": profile.get("python_bin"),
-            "reference_wav": profile.get("reference_wav"),
+            "command": profile.get("command"),
+            "env": profile.get("env") or {},
+            "startup_timeout": profile.get("startup_timeout"),
         }
 
     def _build_runtimes(self, config):
-        runtimes = copy.deepcopy(config.get("runtimes") or {})
-        if runtimes:
-            return runtimes
-
-        # Legacy compatibility: map old config["models"] to runtimes.
-        for name, model in (config.get("models") or {}).items():
-            runtimes[name] = {
-                "driver": "llama_cpp",
-                "gpu": model.get("gpu"),
-                "autoload": model.get("autoload", False),
-                "default_profile": "default",
-                "profiles": {
-                    "default": dict(model),
-                },
-            }
-        return runtimes
+        return copy.deepcopy(config.get("runtimes") or {})
 
     def _reload_from_disk(self):
         config_path = self.config.get("_config_path")
@@ -339,3 +334,28 @@ class RuntimeManager:
             self._append_log(runtime_name, text)
         if proc.returncode not in (None, 0):
             self._append_log(runtime_name, f"[exit] code={proc.returncode}")
+
+
+def _parse_env(value):
+    """Accept env as dict OR 'KEY=value' lines. Returns a dict of str->str.
+
+    Lines starting with '#' are treated as comments. Blank lines are ignored.
+    """
+    if value is None or value == "":
+        return {}
+    if isinstance(value, dict):
+        return {str(k): str(v) for k, v in value.items() if v not in (None, "")}
+    out = {}
+    for raw in str(value).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ValueError(f"Invalid env line (expected KEY=value): {raw!r}")
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if not key:
+            raise ValueError(f"Empty env key in line: {raw!r}")
+        out[key] = val
+    return out

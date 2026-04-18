@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
-"""Managed XTTS HTTP server for llm-proxy."""
+"""Managed XTTS HTTP server for llm-proxy.
 
+Parameters are taken from CLI flags first, env vars as fallback.
+CLI flags (each has a matching LLM_PROXY_XTTS_* env var):
+    --host            (LLM_PROXY_XTTS_HOST,           default 0.0.0.0)
+    --port            (LLM_PROXY_XTTS_PORT,           default 5050)
+    --device          (LLM_PROXY_XTTS_DEVICE,         default cuda)
+    --model-name      (LLM_PROXY_XTTS_MODEL_NAME,     default xtts_v2)
+    --reference-wav   (LLM_PROXY_XTTS_REFERENCE_WAV,  required)
+    --language        (LLM_PROXY_XTTS_LANGUAGE,       default ru)
+    --sample-rate     (LLM_PROXY_XTTS_SAMPLE_RATE,    default 24000)
+Note: Coqui TOS is accepted via COQUI_TOS_AGREED env var (as before).
+"""
+
+import argparse
 import os
 
 import numpy as np
@@ -27,81 +40,103 @@ def _soundfile_load(path, frame_offset=0, num_frames=-1, normalize=True, channel
 
 torchaudio.load = _soundfile_load
 
-HOST = "127.0.0.1"
-PORT = int(os.environ.get("LLM_PROXY_XTTS_PORT", "5050"))
-DEVICE = os.environ.get("LLM_PROXY_XTTS_DEVICE", "cuda")
-MODEL_NAME = os.environ.get("LLM_PROXY_XTTS_MODEL_NAME", "tts_models/multilingual/multi-dataset/xtts_v2")
-REFERENCE_WAV = os.path.expanduser(os.environ["LLM_PROXY_XTTS_REFERENCE_WAV"])
-DEFAULT_LANGUAGE = os.environ.get("LLM_PROXY_XTTS_LANGUAGE", "ru")
-SAMPLE_RATE = int(os.environ.get("LLM_PROXY_XTTS_SAMPLE_RATE", "24000"))
 
-print(f"[xtts] Loading {MODEL_NAME} on {DEVICE}")
-TTS_API = TTS(MODEL_NAME).to(DEVICE)
-XTTS_MODEL = TTS_API.synthesizer.tts_model
-print(f"[xtts] Computing conditioning from {REFERENCE_WAV}")
-GPT_COND_LATENT, SPEAKER_EMBEDDING = XTTS_MODEL.get_conditioning_latents(audio_path=[REFERENCE_WAV])
-print("[xtts] Ready")
+DEFAULT_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
 
 
-def synthesize_cached(text, language, speed=1.0, temperature=0.75):
-    out = XTTS_MODEL.inference(
-        text=text,
-        language=language,
-        gpt_cond_latent=GPT_COND_LATENT,
-        speaker_embedding=SPEAKER_EMBEDDING,
-        speed=speed,
-        temperature=temperature,
-    )
-    wav = out["wav"]
-    if hasattr(wav, "cpu"):
-        return wav.cpu().numpy().squeeze().astype(np.float32)
-    return np.asarray(wav, dtype=np.float32).squeeze()
+def _env_or(name, default=None):
+    value = os.environ.get(name)
+    return value if value is not None and value != "" else default
 
 
-async def handle_tts(request):
-    data = await request.json()
-    text = data.get("text")
-    if not text:
-        return web.json_response({"error": "missing 'text' field"}, status=400)
-    language = data.get("language", DEFAULT_LANGUAGE)
-    speed = float(data.get("speed", 1.0))
-    temperature = float(data.get("temperature", 0.75))
-    audio_np = synthesize_cached(text=text, language=language, speed=speed, temperature=temperature)
-    return web.json_response({
-        "status": "ok",
-        "samples": int(len(audio_np)),
-        "sample_rate": SAMPLE_RATE,
-    })
+def parse_args():
+    p = argparse.ArgumentParser(description="XTTS HTTP server")
+    p.add_argument("--host", default=_env_or("LLM_PROXY_XTTS_HOST", "0.0.0.0"))
+    p.add_argument("--port", type=int, default=int(_env_or("LLM_PROXY_XTTS_PORT", "5050")))
+    p.add_argument("--device", default=_env_or("LLM_PROXY_XTTS_DEVICE", "cuda"))
+    p.add_argument("--model-name", default=_env_or("LLM_PROXY_XTTS_MODEL_NAME", DEFAULT_MODEL))
+    p.add_argument("--reference-wav", default=_env_or("LLM_PROXY_XTTS_REFERENCE_WAV"))
+    p.add_argument("--language", default=_env_or("LLM_PROXY_XTTS_LANGUAGE", "ru"))
+    p.add_argument("--sample-rate", type=int, default=int(_env_or("LLM_PROXY_XTTS_SAMPLE_RATE", "24000")))
+    args = p.parse_args()
+    if not args.reference_wav:
+        p.error("--reference-wav is required (or set LLM_PROXY_XTTS_REFERENCE_WAV)")
+    args.reference_wav = os.path.expanduser(args.reference_wav)
+    return args
 
 
-async def handle_tts_generate(request):
-    data = await request.json()
-    text = data.get("text")
-    if not text:
-        return web.json_response({"error": "missing 'text' field"}, status=400)
-    language = data.get("language", DEFAULT_LANGUAGE)
-    speed = float(data.get("speed", 1.0))
-    temperature = float(data.get("temperature", 0.75))
-    audio_np = synthesize_cached(text=text, language=language, speed=speed, temperature=temperature)
-    return web.Response(body=audio_np.tobytes(), content_type="application/octet-stream")
+def synthesize_factory(xtts_model, gpt_cond_latent, speaker_embedding):
+    def synthesize(text, language, speed=1.0, temperature=0.75):
+        out = xtts_model.inference(
+            text=text,
+            language=language,
+            gpt_cond_latent=gpt_cond_latent,
+            speaker_embedding=speaker_embedding,
+            speed=speed,
+            temperature=temperature,
+        )
+        wav = out["wav"]
+        if hasattr(wav, "cpu"):
+            return wav.cpu().numpy().squeeze().astype(np.float32)
+        return np.asarray(wav, dtype=np.float32).squeeze()
+
+    return synthesize
 
 
-async def handle_health(request):
-    return web.json_response({
-        "status": "ok",
-        "kind": "tts",
-        "model_name": MODEL_NAME,
-        "reference_wav": REFERENCE_WAV,
-        "language": DEFAULT_LANGUAGE,
-    })
+def build_app(args, synthesize):
+    async def handle_tts(request):
+        data = await request.json()
+        text = data.get("text")
+        if not text:
+            return web.json_response({"error": "missing 'text' field"}, status=400)
+        language = data.get("language", args.language)
+        speed = float(data.get("speed", 1.0))
+        temperature = float(data.get("temperature", 0.75))
+        audio_np = synthesize(text=text, language=language, speed=speed, temperature=temperature)
+        return web.json_response({
+            "status": "ok",
+            "samples": int(len(audio_np)),
+            "sample_rate": args.sample_rate,
+        })
 
+    async def handle_tts_generate(request):
+        data = await request.json()
+        text = data.get("text")
+        if not text:
+            return web.json_response({"error": "missing 'text' field"}, status=400)
+        language = data.get("language", args.language)
+        speed = float(data.get("speed", 1.0))
+        temperature = float(data.get("temperature", 0.75))
+        audio_np = synthesize(text=text, language=language, speed=speed, temperature=temperature)
+        return web.Response(body=audio_np.tobytes(), content_type="application/octet-stream")
 
-def main():
+    async def handle_health(request):
+        return web.json_response({
+            "status": "ok",
+            "kind": "tts",
+            "model_name": args.model_name,
+            "reference_wav": args.reference_wav,
+            "language": args.language,
+        })
+
     app = web.Application(client_max_size=16 * 1024 * 1024)
     app.router.add_post("/tts", handle_tts)
     app.router.add_post("/tts/generate", handle_tts_generate)
     app.router.add_get("/health", handle_health)
-    web.run_app(app, host=HOST, port=PORT, handle_signals=True)
+    return app
+
+
+def main():
+    args = parse_args()
+    print(f"[xtts] Loading {args.model_name} on {args.device}")
+    tts_api = TTS(args.model_name).to(args.device)
+    xtts_model = tts_api.synthesizer.tts_model
+    print(f"[xtts] Computing conditioning from {args.reference_wav}")
+    gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(audio_path=[args.reference_wav])
+    print("[xtts] Ready")
+    synthesize = synthesize_factory(xtts_model, gpt_cond_latent, speaker_embedding)
+    app = build_app(args, synthesize)
+    web.run_app(app, host=args.host, port=args.port, handle_signals=True)
 
 
 if __name__ == "__main__":

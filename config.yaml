@@ -4,7 +4,6 @@ listen:
 
 cache_dir: "~/.cache/llm-proxy/kv"
 state_dir: "~/.config/llm-proxy"
-llama_server: "/home/mirmik/project/llama.cpp/build_vulkan/bin/llama-server"
 
 tls:
   enabled: false
@@ -15,6 +14,9 @@ auth:
   enabled: false
   bootstrap_password: null
 
+defaults:
+  llama_bin: "/home/mirmik/project/llama.cpp/build_vulkan/bin/llama-server"
+
 runtimes:
   qwen3.5-122b:
     driver: "llama_cpp"
@@ -23,11 +25,17 @@ runtimes:
     default_profile: "default"
     profiles:
       default:
-        gguf: "~/project/models/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf"
         port: 8081
         slots: 2
-        context: 131072
-        extra_args: "--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 -b 4096 -ub 4096"
+        command: >
+          {defaults.llama_bin}
+          --model ~/project/models/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf
+          -ngl 99 -c 131072 -np {slots}
+          --host 127.0.0.1 --port {port}
+          --slot-save-path {runtime_kv}
+          --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0
+          -b 4096 -ub 4096
+          --jinja
 
   qwen3.5-35b-a3b:
     driver: "llama_cpp"
@@ -36,11 +44,16 @@ runtimes:
     default_profile: "default"
     profiles:
       default:
-        gguf: "~/project/models/Qwen3.5-35B-A3B-Q4_K_M.gguf"
         port: 8082
         slots: 1
-        context: 131072
-        extra_args: "--flash-attn on"
+        command: >
+          {defaults.llama_bin}
+          --model ~/project/models/Qwen3.5-35B-A3B-Q4_K_M.gguf
+          -ngl 99 -c 131072 -np {slots}
+          --host 127.0.0.1 --port {port}
+          --slot-save-path {runtime_kv}
+          --flash-attn on
+          --jinja
 
   stt-main:
     driver: "faster_whisper"
@@ -49,13 +62,16 @@ runtimes:
     default_profile: "ru-large"
     profiles:
       ru-large:
-        venv: "~/project/voice-input/.venv"
         port: 5055
-        model_size: "large-v3"
-        language: "ru"
-        device: "cuda"
-        compute_type: "float16"
-        sample_rate: 16000
+        venv: "~/project/voice-input/.venv"
+        command: >
+          {python} {runners_dir}/faster_whisper_server.py
+          --host 127.0.0.1 --port {port}
+          --model-size large-v3
+          --language ru
+          --device cuda
+          --compute-type float16
+          --sample-rate 16000
 
   tts-main:
     driver: "xtts"
@@ -64,15 +80,19 @@ runtimes:
     default_profile: "mirmik"
     profiles:
       mirmik:
-        venv: "~/project/for-tts-xtts/.venv311"
         port: 5050
-        model_name: "tts_models/multilingual/multi-dataset/xtts_v2"
-        reference_wav: "~/project/for-tts-xtts/reference.wav"
-        language: "ru"
-        device: "cuda"
-        sample_rate: 24000
-        coqui_tos_agreed: "1"
+        venv: "~/project/for-tts-xtts/.venv311"
+        command: >
+          {python} {runners_dir}/xtts_server.py
+          --host 127.0.0.1 --port {port}
+          --model-name tts_models/multilingual/multi-dataset/xtts_v2
+          --reference-wav ~/project/for-tts-xtts/reference.wav
+          --language ru
+          --device cuda
+          --sample-rate 24000
+        env:
+          COQUI_TOS_AGREED: "1"
 
 gpu_groups:
-  local: 32768   # MB VRAM on 5090
-  cluster: null   # no limit (RPC nodes)
+  local: 32768
+  cluster: null

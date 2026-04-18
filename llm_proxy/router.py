@@ -15,6 +15,8 @@ def create_app(runtime_manager, slot_manager, auth_manager=None):
 
     app.router.add_post("/stt", handle_stt_proxy)
     app.router.add_get("/stt/health", handle_stt_health)
+    app.router.add_post("/v1/audio/speech", handle_tts_proxy)
+    app.router.add_get("/tts/health", handle_tts_health)
     app.router.add_post("/login", handle_login)
     app.router.add_post("/logout", handle_logout)
     app.router.add_get("/session", handle_session)
@@ -261,6 +263,92 @@ async def handle_stt_proxy(request):
                 return web.Response(body=raw, status=resp.status, content_type=content_type.split(";")[0])
     except Exception as e:
         return web.json_response({"error": str(e)}, status=502)
+
+
+def _resolve_tts_runtime(rm, requested=None):
+    preferred = requested or "tts-main"
+    tts_runtimes = rm.runtimes_by_kind("tts")
+    if preferred in tts_runtimes:
+        return preferred, None
+    if len(tts_runtimes) == 1:
+        return tts_runtimes[0], None
+    if not tts_runtimes:
+        return None, web.json_response({"error": "No TTS runtime is configured"}, status=404)
+    return None, web.json_response(
+        {"error": f"Multiple TTS runtimes are configured. Available: {tts_runtimes}"},
+        status=400,
+    )
+
+
+async def handle_tts_proxy(request):
+    """POST /v1/audio/speech — JSON in, binary audio out.
+
+    Request body: {text, voice?, language?, speed?, temperature?}
+    `voice` optionally selects the TTS runtime by name.
+    """
+    _require_client_auth(request)
+    rm = request.app["rm"]
+    body = await request.json()
+    requested = body.pop("voice", None) if isinstance(body, dict) else None
+
+    runtime_name, err = _resolve_tts_runtime(rm, requested)
+    if err:
+        return err
+    if not rm.is_running(runtime_name):
+        return web.json_response(
+            {"error": f"TTS runtime '{runtime_name}' is not loaded. Start it explicitly via control API or web UI."},
+            status=503,
+        )
+    port = rm.get_port(runtime_name)
+    if not port:
+        return web.json_response(
+            {"error": f"TTS runtime '{runtime_name}' is marked running but has no bound port."},
+            status=503,
+        )
+
+    backend_url = f"http://127.0.0.1:{port}/tts/generate"
+    response = web.StreamResponse()
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(backend_url, json=body, timeout=aiohttp.ClientTimeout(total=300)) as backend:
+                response.set_status(backend.status)
+                for hk, hv in backend.headers.items():
+                    if hk.lower() in ("content-length", "transfer-encoding", "connection"):
+                        continue
+                    response.headers[hk] = hv
+                await response.prepare(request)
+                async for chunk in backend.content.iter_any():
+                    await response.write(chunk)
+    except Exception as e:
+        if not response.prepared:
+            return web.json_response({"error": str(e)}, status=502)
+
+    await response.write_eof()
+    return response
+
+
+async def handle_tts_health(request):
+    _require_client_auth(request)
+    rm = request.app["rm"]
+    runtime_name, err = _resolve_tts_runtime(rm)
+    if err:
+        return err
+    if not rm.is_running(runtime_name):
+        return web.json_response(
+            {"status": "stopped", "runtime": runtime_name, "loaded": False},
+            status=503,
+        )
+    port = rm.get_port(runtime_name)
+    backend_url = f"http://127.0.0.1:{port}/health"
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(backend_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                data = await resp.json()
+    except Exception as e:
+        return web.json_response({"error": str(e), "runtime": runtime_name}, status=502)
+    data["runtime"] = runtime_name
+    data["loaded"] = True
+    return web.json_response(data)
 
 
 async def handle_stt_health(request):
@@ -760,21 +848,32 @@ def _panel_html():
             <label>Port</label>
             <input data-setting="port" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.port ?? '')}">
           </div>
-          <div>
-            <label>Context</label>
-            <input data-setting="context" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.context ?? '')}">
-          </div>
+          ${settings.kind === 'llm' ? `
           <div>
             <label>Slots</label>
             <input data-setting="slots" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.slots ?? '')}">
           </div>
           <div>
-            <label>Language</label>
-            <input data-setting="language" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.language ?? '')}">
+            <label>Startup Timeout (s)</label>
+            <input data-setting="startup_timeout" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.startup_timeout ?? '')}" placeholder="default 120">
+          </div>
+          ` : `
+          <div>
+            <label>Venv</label>
+            <input data-setting="venv" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.venv ?? '')}" placeholder="~/path/to/venv (resolves {python})">
           </div>
           <div>
-            <label>Model Size</label>
-            <input data-setting="model_size" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.model_size ?? '')}">
+            <label>Startup Timeout (s)</label>
+            <input data-setting="startup_timeout" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.startup_timeout ?? '')}" placeholder="default 120/240">
+          </div>
+          `}
+          <div class="full">
+            <label>Command</label>
+            <textarea data-setting="command" data-name="${escapeHtml(runtime.name)}" rows="6" spellcheck="false" style="font-family:monospace;font-size:0.85rem;">${escapeHtml(settings.command ?? '')}</textarea>
+          </div>
+          <div class="full">
+            <label>Env (KEY=value per line)</label>
+            <textarea data-setting="env" data-name="${escapeHtml(runtime.name)}" rows="3" spellcheck="false" style="font-family:monospace;font-size:0.85rem;">${escapeHtml(formatEnv(settings.env))}</textarea>
           </div>
           <div class="full">
             <button class="secondary" data-action="save-settings" data-name="${escapeHtml(runtime.name)}">Save Settings</button>
@@ -808,15 +907,21 @@ def _panel_html():
       const settings = {};
       for (const field of fields) {
         let value = field.value;
-        if (field.dataset.setting === 'autoload') {
+        const key = field.dataset.setting;
+        if (key === 'autoload') {
           value = value === 'true';
         }
-        settings[field.dataset.setting] = value;
+        settings[key] = value;
       }
       await api('/v1/control/runtimes/' + encodeURIComponent(name) + '/settings', {
         method: 'POST',
         body: JSON.stringify({settings}),
       });
+    }
+
+    function formatEnv(env) {
+      if (!env || typeof env !== 'object') return '';
+      return Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\\n');
     }
 
     function escapeHtml(value) {
