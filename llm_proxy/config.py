@@ -1,5 +1,6 @@
 """Configuration loader."""
 
+import copy
 import os
 
 import yaml
@@ -40,7 +41,7 @@ def load_config(path=None):
                 path = c
                 break
 
-    config = dict(DEFAULT_CONFIG)
+    config = copy.deepcopy(DEFAULT_CONFIG)
     config["_config_path"] = os.path.expanduser(path) if path else None
     if path and os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as f:

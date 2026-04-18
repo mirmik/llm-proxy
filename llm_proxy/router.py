@@ -25,6 +25,8 @@ def create_app(runtime_manager, slot_manager, auth_manager=None):
     app.router.add_post("/v1/models/{name}/load", handle_load)
     app.router.add_post("/v1/models/{name}/unload", handle_unload)
     app.router.add_get("/v1/control/runtimes", handle_runtimes)
+    app.router.add_post("/v1/control/runtimes", handle_runtime_create)
+    app.router.add_post("/v1/control/runtimes/{name}/delete", handle_runtime_delete)
     app.router.add_post("/v1/control/runtimes/{name}/start", handle_runtime_start)
     app.router.add_post("/v1/control/runtimes/{name}/stop", handle_runtime_stop)
     app.router.add_post("/v1/control/runtimes/{name}/select-profile", handle_runtime_select_profile)
@@ -507,6 +509,64 @@ async def handle_runtimes(request):
     return web.json_response({"runtimes": rm.list_state()})
 
 
+async def handle_runtime_create(request):
+    """POST /v1/control/runtimes — create a new runtime.
+
+    Body: {name, driver, gpu?, autoload?, on_demand?, profile_name?,
+           profile: {port, command, slots?, venv?, python_bin?, env?, ...}}
+    env may be a dict or a 'KEY=value' string (one per line).
+    """
+    _require_control_auth(request)
+    rm = request.app["rm"]
+    body = await request.json()
+
+    profile = body.get("profile") or {}
+    if "env" in profile:
+        try:
+            from llm_proxy.runtime_manager import _parse_env
+            profile["env"] = _parse_env(profile["env"])
+        except ValueError as e:
+            return web.json_response({"error": f"invalid env: {e}"}, status=400)
+        if not profile["env"]:
+            profile.pop("env", None)
+
+    try:
+        await rm.create_runtime({
+            "name": body.get("name"),
+            "driver": body.get("driver"),
+            "gpu": body.get("gpu"),
+            "autoload": body.get("autoload", False),
+            "on_demand": body.get("on_demand", False),
+            "profile_name": body.get("profile_name"),
+            "profile": profile,
+        })
+    except ValueError as e:
+        msg = str(e)
+        status = 409 if "already exists" in msg else 400
+        return web.json_response({"error": msg}, status=status)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+    name = body.get("name")
+    return web.json_response({"ok": True, "runtime": rm.runtime_state(name)})
+
+
+async def handle_runtime_delete(request):
+    """POST /v1/control/runtimes/{name}/delete — remove a runtime."""
+    _require_control_auth(request)
+    rm = request.app["rm"]
+    name = request.match_info["name"]
+    try:
+        await rm.delete_runtime(name)
+    except ValueError as e:
+        msg = str(e)
+        status = 404 if "Unknown runtime" in msg else 400
+        return web.json_response({"error": msg}, status=status)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+    return web.json_response({"ok": True, "deleted": name})
+
+
 async def handle_runtime_start(request):
     """POST /v1/control/runtimes/{name}/start."""
     _require_control_auth(request)
@@ -771,10 +831,79 @@ def _panel_html():
       <div class="card">
         <div class="toolbar">
           <strong>Managed Runtimes</strong>
-          <button class="secondary" id="refreshBtn" style="width:auto;padding:10px 18px;">Refresh</button>
+          <div style="display:flex; gap:8px;">
+            <button id="newRuntimeBtn" style="width:auto;padding:10px 18px;">+ New Runtime</button>
+            <button class="secondary" id="refreshBtn" style="width:auto;padding:10px 18px;">Refresh</button>
+          </div>
         </div>
         <div class="message" id="stateMsg"></div>
       </div>
+      <section class="card" id="newRuntimeForm" hidden>
+        <div class="toolbar">
+          <strong>Create Runtime</strong>
+          <button class="warning" id="newRuntimeCancel" style="width:auto;padding:6px 12px;">Cancel</button>
+        </div>
+        <div class="settings-grid" style="margin-top:12px;">
+          <div>
+            <label>Name *</label>
+            <input id="nr-name" placeholder="my-runtime">
+          </div>
+          <div>
+            <label>Driver *</label>
+            <select id="nr-driver">
+              <option value="llama_cpp">llama_cpp (LLM)</option>
+              <option value="faster_whisper">faster_whisper (STT)</option>
+              <option value="xtts">xtts (TTS)</option>
+            </select>
+          </div>
+          <div>
+            <label>GPU</label>
+            <input id="nr-gpu" placeholder="local">
+          </div>
+          <div>
+            <label>Profile name</label>
+            <input id="nr-profile" placeholder="default">
+          </div>
+          <div>
+            <label>Autoload</label>
+            <select id="nr-autoload">
+              <option value="false">false</option>
+              <option value="true">true</option>
+            </select>
+          </div>
+          <div>
+            <label>On Demand</label>
+            <select id="nr-ondemand">
+              <option value="false">false</option>
+              <option value="true">true</option>
+            </select>
+          </div>
+          <div>
+            <label>Port *</label>
+            <input id="nr-port" placeholder="8083">
+          </div>
+          <div id="nr-slots-wrap">
+            <label>Slots</label>
+            <input id="nr-slots" value="1">
+          </div>
+          <div class="full" id="nr-venv-wrap" hidden>
+            <label>Venv (resolves {python})</label>
+            <input id="nr-venv" placeholder="~/project/.../venv">
+          </div>
+          <div class="full">
+            <label>Command * (use {port}, {slots}, {python}, {runners_dir}, {runtime_kv}, {defaults.*})</label>
+            <textarea id="nr-command" rows="6" spellcheck="false" style="font-family:monospace;font-size:0.85rem;"></textarea>
+          </div>
+          <div class="full">
+            <label>Env (KEY=value per line)</label>
+            <textarea id="nr-env" rows="3" spellcheck="false" style="font-family:monospace;font-size:0.85rem;"></textarea>
+          </div>
+          <div class="full">
+            <button class="secondary" id="newRuntimeCreate">Create</button>
+          </div>
+          <div class="full message" id="newRuntimeMsg"></div>
+        </div>
+      </section>
       <div class="grid" id="runtimes"></div>
     </section>
   </div>
@@ -914,7 +1043,10 @@ def _panel_html():
             <button class="secondary" data-action="save-settings" data-name="${escapeHtml(runtime.name)}">Save Settings</button>
           </div>
         </div>
-        <button style="margin-top:10px;background:#44403c;" data-action="logs-runtime" data-name="${escapeHtml(runtime.name)}">Show Logs</button>
+        <div style="display:flex; gap:8px; margin-top:10px;">
+          <button style="background:#44403c; flex:1;" data-action="logs-runtime" data-name="${escapeHtml(runtime.name)}">Show Logs</button>
+          <button class="warning" style="flex:0 0 auto; padding:10px 14px;" data-action="delete-runtime" data-name="${escapeHtml(runtime.name)}">Delete</button>
+        </div>
         <pre id="logs-${escapeHtml(runtime.name)}" hidden></pre>
       </article>`;
     }
@@ -971,6 +1103,70 @@ def _panel_html():
     document.getElementById('logoutBtn').addEventListener('click', logout);
     document.getElementById('refreshBtn').addEventListener('click', refreshState);
 
+    const newRuntimeForm = document.getElementById('newRuntimeForm');
+    const newRuntimeMsg = document.getElementById('newRuntimeMsg');
+
+    document.getElementById('newRuntimeBtn').addEventListener('click', () => {
+      newRuntimeForm.hidden = !newRuntimeForm.hidden;
+      if (!newRuntimeForm.hidden) {
+        newRuntimeMsg.textContent = '';
+        document.getElementById('nr-name').focus();
+      }
+    });
+    document.getElementById('newRuntimeCancel').addEventListener('click', () => {
+      newRuntimeForm.hidden = true;
+    });
+    document.getElementById('nr-driver').addEventListener('change', updateDriverFields);
+    function updateDriverFields() {
+      const driver = document.getElementById('nr-driver').value;
+      const isLlama = driver === 'llama_cpp';
+      document.getElementById('nr-slots-wrap').hidden = !isLlama;
+      document.getElementById('nr-venv-wrap').hidden = isLlama;
+    }
+    updateDriverFields();
+
+    document.getElementById('newRuntimeCreate').addEventListener('click', async () => {
+      newRuntimeMsg.textContent = '';
+      const driver = document.getElementById('nr-driver').value;
+      const profile = {
+        port: document.getElementById('nr-port').value.trim(),
+        command: document.getElementById('nr-command').value,
+      };
+      if (driver === 'llama_cpp') {
+        const slots = document.getElementById('nr-slots').value.trim();
+        if (slots) profile.slots = parseInt(slots, 10);
+      } else {
+        const venv = document.getElementById('nr-venv').value.trim();
+        if (venv) profile.venv = venv;
+      }
+      const envText = document.getElementById('nr-env').value.trim();
+      if (envText) profile.env = envText;
+
+      const body = {
+        name: document.getElementById('nr-name').value.trim(),
+        driver,
+        gpu: document.getElementById('nr-gpu').value.trim() || null,
+        autoload: document.getElementById('nr-autoload').value === 'true',
+        on_demand: document.getElementById('nr-ondemand').value === 'true',
+        profile_name: document.getElementById('nr-profile').value.trim() || 'default',
+        profile,
+      };
+      try {
+        await api('/v1/control/runtimes', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+        newRuntimeForm.hidden = true;
+        [
+          'nr-name','nr-gpu','nr-profile','nr-port','nr-venv','nr-command','nr-env'
+        ].forEach((id) => { document.getElementById(id).value = ''; });
+        document.getElementById('nr-slots').value = '1';
+        await refreshState();
+      } catch (e) {
+        newRuntimeMsg.textContent = 'Create failed: ' + e.message;
+      }
+    });
+
     checkAuth();
     document.addEventListener('click', async (event) => {
       const target = event.target.closest('[data-action]');
@@ -991,6 +1187,9 @@ def _panel_html():
           return;
         } else if (action === 'save-settings') {
           await saveSettings(name);
+        } else if (action === 'delete-runtime') {
+          if (!confirm(`Delete runtime '${name}'? This removes it from config.yaml and stops the process if running.`)) return;
+          await api('/v1/control/runtimes/' + encodeURIComponent(name) + '/delete', {method: 'POST'});
         }
         await refreshState();
       } catch (e) {

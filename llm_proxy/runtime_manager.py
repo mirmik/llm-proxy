@@ -4,10 +4,14 @@ import asyncio
 import copy
 import json
 import os
+import re
 import signal
 from collections import deque
 
 import aiohttp
+
+
+_VALID_NAME = re.compile(r"^(?!\.)[a-zA-Z0-9_.\-]+$")
 
 from llm_proxy.config import load_config, load_config_file, save_config_file
 from llm_proxy.drivers import build_driver_registry
@@ -204,6 +208,100 @@ class RuntimeManager:
         if self.is_running(runtime_name):
             await self.stop(runtime_name)
             await self.start(runtime_name)
+
+    async def create_runtime(self, spec):
+        """Create a new runtime and persist it to the config file.
+
+        spec is a dict with keys:
+          name (required)         — runtime identifier, unique
+          driver (required)       — llama_cpp / faster_whisper / xtts
+          gpu (optional)
+          autoload (optional)
+          on_demand (optional)
+          profile_name (optional) — defaults to 'default'
+          profile (required)      — profile dict with at least port+command
+        """
+        config_path = self.config.get("_config_path")
+        if not config_path:
+            raise ValueError("No writable config path is associated with the running server")
+
+        name = str(spec.get("name") or "").strip()
+        if not name:
+            raise ValueError("'name' is required")
+        if not _VALID_NAME.match(name):
+            raise ValueError("'name' must be [a-zA-Z0-9_.-]+ and cannot start with a dot")
+
+        driver_name = str(spec.get("driver") or "").strip()
+        if not driver_name:
+            raise ValueError("'driver' is required")
+        if driver_name not in self.drivers:
+            raise ValueError(f"Unknown driver: {driver_name!r}. Available: {sorted(self.drivers)}")
+
+        profile_name = str(spec.get("profile_name") or "default").strip() or "default"
+        profile = spec.get("profile") or {}
+        if not isinstance(profile, dict):
+            raise ValueError("'profile' must be an object")
+        if not profile.get("command"):
+            raise ValueError("profile.command is required")
+        if not profile.get("port"):
+            raise ValueError("profile.port is required")
+        try:
+            port = int(profile["port"])
+        except (TypeError, ValueError):
+            raise ValueError("profile.port must be an integer")
+        profile["port"] = port
+
+        raw = load_config_file(config_path)
+        runtimes = raw.setdefault("runtimes", {}) or {}
+        raw["runtimes"] = runtimes
+        if name in runtimes:
+            raise ValueError(f"Runtime {name!r} already exists")
+
+        # Optional: warn about port collision with another configured runtime.
+        for other_name, other in runtimes.items():
+            for _, other_profile in (other.get("profiles") or {}).items():
+                if int(other_profile.get("port", 0)) == port:
+                    raise ValueError(
+                        f"Port {port} is already used by runtime {other_name!r}. "
+                        f"Choose another port."
+                    )
+
+        entry = {"driver": driver_name}
+        if spec.get("gpu") not in (None, ""):
+            entry["gpu"] = str(spec["gpu"])
+        if "autoload" in spec:
+            entry["autoload"] = bool(spec["autoload"])
+        if "on_demand" in spec:
+            entry["on_demand"] = bool(spec["on_demand"])
+        entry["default_profile"] = profile_name
+        entry["profiles"] = {profile_name: profile}
+        runtimes[name] = entry
+
+        save_config_file(config_path, raw)
+        self._reload_from_disk()
+
+    async def delete_runtime(self, runtime_name):
+        """Stop the runtime (if running) and remove it from the config file."""
+        config_path = self.config.get("_config_path")
+        if not config_path:
+            raise ValueError("No writable config path is associated with the running server")
+
+        if runtime_name not in self.runtimes:
+            raise ValueError(f"Unknown runtime: {runtime_name!r}")
+
+        if self.is_running(runtime_name):
+            await self.stop(runtime_name)
+
+        raw = load_config_file(config_path)
+        runtimes = raw.setdefault("runtimes", {}) or {}
+        runtimes.pop(runtime_name, None)
+        raw["runtimes"] = runtimes
+        save_config_file(config_path, raw)
+
+        self._profiles.pop(runtime_name, None)
+        self._logs.pop(runtime_name, None)
+        self._save_state()
+        self._reload_from_disk()
 
     async def update_settings(self, runtime_name, settings):
         runtime = self.runtimes.get(runtime_name)
