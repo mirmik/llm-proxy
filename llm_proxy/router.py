@@ -85,10 +85,19 @@ async def handle_chat(request):
         return err
 
     if not rm.is_running(model_name):
-        return web.json_response(
-            {"error": f"Model '{model_name}' is not loaded. Load it explicitly via control API or web UI."},
-            status=503,
-        )
+        if rm.on_demand(model_name):
+            try:
+                await rm.ensure(model_name)
+            except Exception as e:
+                return web.json_response(
+                    {"error": f"Failed to start {model_name} on demand: {e}"},
+                    status=503,
+                )
+        else:
+            return web.json_response(
+                {"error": f"Model '{model_name}' is not loaded. Load it explicitly via control API or web UI, or enable on_demand."},
+                status=503,
+            )
 
     port = rm.get_port(model_name)
     if not port:
@@ -223,10 +232,19 @@ async def handle_stt_proxy(request):
     if err:
         return err
     if not rm.is_running(runtime_name):
-        return web.json_response(
-            {"error": f"STT runtime '{runtime_name}' is not loaded. Start it explicitly via control API or web UI."},
-            status=503,
-        )
+        if rm.on_demand(runtime_name):
+            try:
+                await rm.ensure(runtime_name)
+            except Exception as e:
+                return web.json_response(
+                    {"error": f"Failed to start {runtime_name} on demand: {e}"},
+                    status=503,
+                )
+        else:
+            return web.json_response(
+                {"error": f"STT runtime '{runtime_name}' is not loaded. Start it explicitly via control API or web UI, or enable on_demand."},
+                status=503,
+            )
     port = rm.get_port(runtime_name)
     if not port:
         return web.json_response(
@@ -295,10 +313,19 @@ async def handle_tts_proxy(request):
     if err:
         return err
     if not rm.is_running(runtime_name):
-        return web.json_response(
-            {"error": f"TTS runtime '{runtime_name}' is not loaded. Start it explicitly via control API or web UI."},
-            status=503,
-        )
+        if rm.on_demand(runtime_name):
+            try:
+                await rm.ensure(runtime_name)
+            except Exception as e:
+                return web.json_response(
+                    {"error": f"Failed to start {runtime_name} on demand: {e}"},
+                    status=503,
+                )
+        else:
+            return web.json_response(
+                {"error": f"TTS runtime '{runtime_name}' is not loaded. Start it explicitly via control API or web UI, or enable on_demand."},
+                status=503,
+            )
     port = rm.get_port(runtime_name)
     if not port:
         return web.json_response(
@@ -824,6 +851,7 @@ def _panel_html():
           <div>profile: ${escapeHtml(runtime.profile || '—')}</div>
           <div>port: ${escapeHtml(runtime.port || '—')}</div>
           <div>gpu: ${escapeHtml(runtime.gpu || '—')}</div>
+          <div>autoload: ${runtime.autoload ? 'yes' : 'no'} / on-demand: ${runtime.on_demand ? 'yes' : 'no'}</div>
           <div>health: ${escapeHtml(runtime.health_url || '—')}</div>
         </div>
         ${runtime.profiles && runtime.profiles.length ? `
@@ -842,6 +870,13 @@ def _panel_html():
             <select data-setting="autoload" data-name="${escapeHtml(runtime.name)}">
               <option value="true" ${settings.autoload ? 'selected' : ''}>true</option>
               <option value="false" ${!settings.autoload ? 'selected' : ''}>false</option>
+            </select>
+          </div>
+          <div>
+            <label>On Demand</label>
+            <select data-setting="on_demand" data-name="${escapeHtml(runtime.name)}">
+              <option value="true" ${settings.on_demand ? 'selected' : ''}>true</option>
+              <option value="false" ${!settings.on_demand ? 'selected' : ''}>false</option>
             </select>
           </div>
           <div>
@@ -908,7 +943,7 @@ def _panel_html():
       for (const field of fields) {
         let value = field.value;
         const key = field.dataset.setting;
-        if (key === 'autoload') {
+        if (key === 'autoload' || key === 'on_demand') {
           value = value === 'true';
         }
         settings[key] = value;

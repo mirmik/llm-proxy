@@ -88,12 +88,17 @@ class RuntimeManager:
             "profile": self.current_profile(runtime_name),
             "profiles": list((runtime.get("profiles") or {}).keys()),
             "autoload": bool(runtime.get("autoload", False)),
+            "on_demand": self.on_demand(runtime_name),
             "gpu": profile.get("gpu"),
             "health_url": driver.resolve_health_url(runtime_name, profile, self.config),
             "pid": self._processes.get(runtime_name).pid if self.is_running(runtime_name) else None,
             "settings": self._editable_settings(runtime_name),
             **meta,
         }
+
+    def on_demand(self, runtime_name):
+        runtime = self.runtimes.get(runtime_name) or {}
+        return bool(runtime.get("on_demand", False))
 
     def list_state(self):
         return [self.runtime_state(name) for name in self.available_runtimes()]
@@ -223,9 +228,11 @@ class RuntimeManager:
 
         if "autoload" in settings:
             raw_runtime["autoload"] = bool(settings["autoload"])
+        if "on_demand" in settings:
+            raw_runtime["on_demand"] = bool(settings["on_demand"])
 
         for key, value in settings.items():
-            if key == "autoload":
+            if key in ("autoload", "on_demand"):
                 continue
             if key == "env":
                 env_dict = _parse_env(value)
@@ -270,6 +277,7 @@ class RuntimeManager:
         current_profile = self.current_profile(runtime_name)
         return {
             "autoload": bool(runtime.get("autoload", False)),
+            "on_demand": bool(runtime.get("on_demand", False)),
             "profile_name": current_profile,
             "kind": driver.kind(),
             "port": profile.get("port"),
