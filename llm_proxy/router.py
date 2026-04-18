@@ -1043,11 +1043,11 @@ def _panel_html():
             <button class="secondary" data-action="save-settings" data-name="${escapeHtml(runtime.name)}">Save Settings</button>
           </div>
         </div>
-        <div style="display:flex; gap:8px; margin-top:10px;">
-          <button style="background:#44403c; flex:1;" data-action="logs-runtime" data-name="${escapeHtml(runtime.name)}">Show Logs</button>
-          <button class="warning" style="flex:0 0 auto; padding:10px 14px;" data-action="delete-runtime" data-name="${escapeHtml(runtime.name)}">Delete</button>
-        </div>
+        <button style="margin-top:10px;background:#44403c;" data-action="logs-runtime" data-name="${escapeHtml(runtime.name)}">Show Logs</button>
         <pre id="logs-${escapeHtml(runtime.name)}" hidden></pre>
+        <div style="margin-top:8px; display:flex; justify-content:flex-end;">
+          <button class="warning" style="width:auto; padding:6px 14px; font-size:0.82rem;" data-action="delete-runtime" data-name="${escapeHtml(runtime.name)}">Delete</button>
+        </div>
       </article>`;
     }
 
