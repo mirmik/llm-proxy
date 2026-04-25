@@ -10,7 +10,6 @@ from aiohttp import web
 from llm_proxy.auth import AuthManager
 from llm_proxy.certs import certificate_fingerprint, generate_server_cert, make_ssl_context
 from llm_proxy.config import load_config
-from llm_proxy.https_client import post_json
 from llm_proxy.resource_coordinator import ResourceCoordinator
 from llm_proxy.runtime_manager import RuntimeManager
 from llm_proxy.slot_manager import SlotManager
@@ -74,23 +73,16 @@ def main():
 
     subparsers.add_parser("serve", help="Run the proxy server")
 
-    auth = subparsers.add_parser("auth", help="Manage control-plane authentication")
+    auth = subparsers.add_parser("auth", help="Manage API tokens")
     auth_subparsers = auth.add_subparsers(dest="auth_command", required=True)
 
-    invite = auth_subparsers.add_parser("invite", help="Create a one-time bootstrap invite")
-    invite.add_argument("host_id", help="Stable host identifier")
-    invite.add_argument("--ttl-hours", type=float, default=24.0, help="Invite lifetime in hours")
+    create = auth_subparsers.add_parser("create", help="Create a new token (plain value shown once)")
+    create.add_argument("name", help="Human-readable token name (e.g. host or client name)")
 
-    login = auth_subparsers.add_parser("login", help="Bootstrap and save local control credentials")
-    login.add_argument("--server", required=True, help="Control API URL, preferably https://...")
-    login.add_argument("--token", default=None, help="One-time invite token")
-    login.add_argument("--password", default=None, help="Bootstrap password")
-    login.add_argument("--host-id", default=None, help="Stable host identifier, required for password login")
+    auth_subparsers.add_parser("list", help="List existing tokens (no secrets)")
 
-    set_password = auth_subparsers.add_parser("set-password", help="Store a bootstrap password hash")
-    set_password.add_argument("password", help="Bootstrap password")
-
-    clear_password = auth_subparsers.add_parser("clear-password", help="Remove stored bootstrap password")
+    revoke = auth_subparsers.add_parser("revoke", help="Revoke a token by id or name")
+    revoke.add_argument("identifier", help="Token id or name")
 
     cert = subparsers.add_parser("cert", help="Manage HTTPS certificates")
     cert_subparsers = cert.add_subparsers(dest="cert_command", required=True)
@@ -121,54 +113,36 @@ def main():
             print("  Note: update config tls.cert_file/tls.key_file if you want to use these paths.")
         return
 
-    if args.auth_command == "invite":
-        token, invite_meta = auth_manager.create_invite(args.host_id, ttl_hours=args.ttl_hours)
-        print("Invite created:")
-        print(f"  Host ID:    {invite_meta['host_id']}")
-        print(f"  Expires at: {invite_meta['expires_at']}")
-        print(f"  Token:      {token}")
+    if args.auth_command == "create":
+        record = auth_manager.create_token(args.name)
+        print("Token created. Copy it now — it will not be shown again.")
+        print(f"  id:    {record['id']}")
+        print(f"  name:  {record['name']}")
+        print(f"  token: {record['token']}")
+        print()
+        print("Use as: Authorization: Bearer " + record["token"])
         return
 
-    if args.auth_command == "login":
-        if bool(args.token) == bool(args.password):
-            raise SystemExit("pass exactly one of --token or --password")
-        payload = {}
-        if args.token:
-            payload["token"] = args.token
-        if args.password:
-            if not args.host_id:
-                raise SystemExit("--host-id is required with --password")
-            payload["password"] = args.password
-            payload["host_id"] = args.host_id
-        body = post_json(args.server.rstrip("/") + "/v1/auth/bootstrap", payload, timeout=30)
-        host_id = body["host_id"]
-        token = body["token"]
-        server_fingerprint = body.get("_server_fingerprint")
-        if args.server.startswith("https://") and not server_fingerprint:
-            raise SystemExit("login over HTTPS did not return a server fingerprint")
-        auth_manager.save_local_auth(
-            server=args.server,
-            host_id=host_id,
-            token=token,
-            server_fingerprint=server_fingerprint,
-        )
-        print("Login completed:")
-        print(f"  Server:      {args.server}")
-        print(f"  Host ID:     {host_id}")
-        if server_fingerprint:
-            print(f"  Fingerprint: {server_fingerprint}")
-        print(f"  Auth:        {auth_manager.local_auth_path()}")
+    if args.auth_command == "list":
+        records = auth_manager.list_tokens()
+        if not records:
+            print("(no tokens)")
+            return
+        print(f"{'id':<14} {'name':<20} created                  last used")
+        for r in records:
+            print(
+                f"{r.get('id',''):<14} "
+                f"{r.get('name',''):<20} "
+                f"{r.get('created_at') or '-':<24} "
+                f"{r.get('last_used_at') or '-'}"
+            )
         return
 
-    if args.auth_command == "set-password":
-        auth_manager.set_bootstrap_password(args.password)
-        print("Bootstrap password stored.")
-        print(f"  File: {os.path.join(auth_manager.state_dir, 'auth_bootstrap.json')}")
-        return
-
-    if args.auth_command == "clear-password":
-        auth_manager.clear_bootstrap_password()
-        print("Bootstrap password cleared.")
+    if args.auth_command == "revoke":
+        ok = auth_manager.revoke_token(args.identifier)
+        if not ok:
+            raise SystemExit(f"no such token: {args.identifier}")
+        print(f"Revoked: {args.identifier}")
         return
 
 

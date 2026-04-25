@@ -17,7 +17,6 @@ DEFAULT_CONFIG = {
     },
     "auth": {
         "enabled": False,
-        "bootstrap_password": None,
     },
     "web_auth": {
         "enabled": False,

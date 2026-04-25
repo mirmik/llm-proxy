@@ -35,8 +35,10 @@ def create_app(runtime_manager, slot_manager, auth_manager=None):
     app.router.add_get("/v1/control/state", handle_control_state)
     app.router.add_post("/v1/control/models/{name}/load", handle_load)
     app.router.add_post("/v1/control/models/{name}/unload", handle_unload)
-    app.router.add_post("/v1/auth/bootstrap", handle_auth_bootstrap)
     app.router.add_get("/v1/control/whoami", handle_control_whoami)
+    app.router.add_get("/v1/control/tokens", handle_tokens_list)
+    app.router.add_post("/v1/control/tokens", handle_tokens_create)
+    app.router.add_delete("/v1/control/tokens/{id}", handle_tokens_revoke)
     app.router.add_get("/", handle_panel)
     app.router.add_get("/health", handle_health)
 
@@ -462,35 +464,46 @@ async def handle_session(request):
     return web.json_response({"authenticated": bool(username), "username": username})
 
 
-async def handle_auth_bootstrap(request):
-    """POST /v1/auth/bootstrap — exchange invite/password for long-lived host token."""
-    auth = request.app.get("auth")
-    if auth is None or not auth.enabled:
-        return web.json_response({"error": "auth is disabled"}, status=400)
-
-    body = await request.json()
-    try:
-        result = auth.bootstrap(
-            token=body.get("token", ""),
-            password=body.get("password", ""),
-            host_id=body.get("host_id", ""),
-        )
-    except ValueError as e:
-        return web.json_response({"error": str(e)}, status=400)
-    except PermissionError as e:
-        return web.json_response({"error": str(e)}, status=403)
-
-    return web.json_response({
-        "ok": True,
-        "host_id": result["host_id"],
-        "token": result["token"],
-    })
-
-
 async def handle_control_whoami(request):
     """GET /v1/control/whoami — validate control credentials."""
-    host_id = _require_control_auth(request)
-    return web.json_response({"ok": True, "host_id": host_id})
+    identity = _require_control_auth(request)
+    return web.json_response({"ok": True, "identity": identity})
+
+
+async def handle_tokens_list(request):
+    """GET /v1/control/tokens — list issued tokens (no secrets)."""
+    _require_control_auth(request)
+    auth = request.app.get("auth")
+    if auth is None:
+        return web.json_response({"tokens": []})
+    return web.json_response({"tokens": auth.list_tokens()})
+
+
+async def handle_tokens_create(request):
+    """POST /v1/control/tokens — create a token. Plain value returned ONCE."""
+    _require_control_auth(request)
+    auth = request.app.get("auth")
+    if auth is None:
+        return web.json_response({"error": "auth is disabled"}, status=400)
+    body = await request.json()
+    try:
+        record = auth.create_token(body.get("name", ""))
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    return web.json_response({"ok": True, "token": record})
+
+
+async def handle_tokens_revoke(request):
+    """DELETE /v1/control/tokens/{id} — revoke by id or name."""
+    _require_control_auth(request)
+    auth = request.app.get("auth")
+    if auth is None:
+        return web.json_response({"error": "auth is disabled"}, status=400)
+    identifier = request.match_info.get("id", "")
+    ok = auth.revoke_token(identifier)
+    if not ok:
+        return web.json_response({"error": f"no such token: {identifier}"}, status=404)
+    return web.json_response({"ok": True, "revoked": identifier})
 
 
 async def handle_control_state(request):
