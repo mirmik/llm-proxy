@@ -18,6 +18,10 @@ DEFAULT_CONFIG = {
     "auth": {
         "enabled": False,
     },
+    "control": {
+        "host": "0.0.0.0",
+        "port": None,  # defaults to listen.port + 1 if not set
+    },
     "web_auth": {
         "enabled": False,
         "session_ttl_hours": 168,

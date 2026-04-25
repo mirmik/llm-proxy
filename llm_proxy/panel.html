@@ -313,6 +313,13 @@
     <section class="card">
       <h2>API tokens</h2>
       <p class="hint">Tokens authenticate non-browser clients. Use as <code>Authorization: Bearer &lt;token&gt;</code>. The plain value is shown only once at creation.</p>
+      <div class="row" style="align-items:center;">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
+          <input type="checkbox" id="apiAuthToggle" style="width:auto;">
+          <span>Require token for API requests</span>
+        </label>
+      </div>
+      <div class="msg" id="apiAuthMsg"></div>
       <div class="row">
         <div class="field grow"><label>New token name</label><input id="tokenName" placeholder="aionshad / nemor / ..."></div>
         <div class="field"><label>&nbsp;</label><button class="btn" id="tokenCreateBtn">Create token</button></div>
@@ -370,6 +377,7 @@
   // ---------- view switcher ----------
   let webAuthEnabled = false;
   let webAuthenticated = false;
+  let apiAuthEnabled = false;
   let currentView = "runtimes";
 
   const navButtons = document.querySelectorAll("#topnav .nav-btn");
@@ -402,12 +410,33 @@
       const data = await api("/session");
       webAuthEnabled = !!data.web_auth_enabled;
       webAuthenticated = !!data.authenticated;
+      apiAuthEnabled = !!data.api_auth_enabled;
     } catch (e) {
-      webAuthEnabled = false; webAuthenticated = false;
+      webAuthEnabled = false; webAuthenticated = false; apiAuthEnabled = false;
     }
     applyPasswordUi();
+    document.getElementById("apiAuthToggle").checked = apiAuthEnabled;
     showView(currentView);
   }
+
+  document.getElementById("apiAuthToggle").addEventListener("change", async (e) => {
+    const desired = e.target.checked;
+    setMsg(document.getElementById("apiAuthMsg"), "");
+    try {
+      const data = await api("/v1/control/api-auth", {
+        method: "POST",
+        body: JSON.stringify({enabled: desired}),
+      });
+      apiAuthEnabled = !!data.api_auth_enabled;
+      e.target.checked = apiAuthEnabled;
+      setMsg(document.getElementById("apiAuthMsg"),
+        apiAuthEnabled ? "Token now required for API requests." : "API requests are now open.",
+        "ok");
+    } catch (err) {
+      e.target.checked = apiAuthEnabled; // revert
+      setMsg(document.getElementById("apiAuthMsg"), "Failed: " + err.message, "error");
+    }
+  });
 
   document.getElementById("loginBtn").addEventListener("click", async () => {
     setMsg(loginMsg, "");

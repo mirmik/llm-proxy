@@ -27,11 +27,35 @@ _SECRET_LEN = 40
 
 class AuthManager:
     def __init__(self, config):
-        self.enabled = bool(((config.get("auth") or {}).get("enabled", False)))
+        self._config_enabled = bool(((config.get("auth") or {}).get("enabled", False)))
         self.state_dir = os.path.expanduser(config["state_dir"])
         self.web_auth_cfg = config.get("web_auth") or {}
         self._sessions = {}
         self._session_cookie = "llm_proxy_session"
+
+    @property
+    def enabled(self):
+        """API token requirement: file in state_dir overrides config.yaml."""
+        path = self._api_auth_path()
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return bool(json.load(f).get("enabled"))
+            except Exception:
+                pass
+        return self._config_enabled
+
+    def set_api_auth_enabled(self, value):
+        path = self._api_auth_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"enabled": bool(value), "updated_at": self._now()}, f, indent=2)
+        os.replace(tmp, path)
+        return self.enabled
+
+    def _api_auth_path(self):
+        return os.path.join(self.state_dir, "api_auth.json")
 
     @property
     def web_enabled(self):
@@ -82,14 +106,19 @@ class AuthManager:
     # ---- request guards ----
 
     def require_control(self, request):
+        """Control endpoints (UI). Open until a web password is set."""
+        if not self.web_enabled:
+            return "anonymous"
         web_user = self.get_web_user(request)
         if web_user:
             return f"web:{web_user}"
-        if not self.enabled:
-            return None
-        return self._require_token(request)
+        raise web.HTTPUnauthorized(
+            text=json.dumps({"error": "login required"}),
+            content_type="application/json",
+        )
 
     def require_client(self, request):
+        """API endpoints (chat / stt / tts). Bearer token when auth.enabled."""
         if not self.enabled:
             return None
         return self._require_token(request)

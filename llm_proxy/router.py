@@ -7,24 +7,38 @@ import aiohttp
 from aiohttp import web
 
 
-def create_app(runtime_manager, slot_manager, auth_manager=None):
-    """Create aiohttp app with all routes."""
+def _setup_app(rm, sm, auth):
     app = web.Application()
-    app["rm"] = runtime_manager
-    app["sm"] = slot_manager
-    app["auth"] = auth_manager
+    app["rm"] = rm
+    app["sm"] = sm
+    app["auth"] = auth
+    return app
 
+
+def create_api_app(runtime_manager, slot_manager, auth_manager=None):
+    """Public API surface: inference + discovery. Token-gated when auth.enabled."""
+    app = _setup_app(runtime_manager, slot_manager, auth_manager)
     app.router.add_post("/stt", handle_stt_proxy)
     app.router.add_get("/stt/health", handle_stt_health)
     app.router.add_post("/v1/audio/speech", handle_tts_proxy)
     app.router.add_get("/tts/health", handle_tts_health)
-    app.router.add_post("/login", handle_login)
-    app.router.add_post("/logout", handle_logout)
-    app.router.add_get("/session", handle_session)
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_post("/v1/models/{name}/load", handle_load)
     app.router.add_post("/v1/models/{name}/unload", handle_unload)
+    app.router.add_get("/health", handle_health)
+    return app
+
+
+def create_control_app(runtime_manager, slot_manager, auth_manager=None):
+    """Control plane: web UI + runtime/token/password management.
+
+    Open by default. Set a web password to require login.
+    """
+    app = _setup_app(runtime_manager, slot_manager, auth_manager)
+    app.router.add_post("/login", handle_login)
+    app.router.add_post("/logout", handle_logout)
+    app.router.add_get("/session", handle_session)
     app.router.add_get("/v1/control/runtimes", handle_runtimes)
     app.router.add_post("/v1/control/runtimes", handle_runtime_create)
     app.router.add_post("/v1/control/runtimes/{name}/delete", handle_runtime_delete)
@@ -42,9 +56,8 @@ def create_app(runtime_manager, slot_manager, auth_manager=None):
     app.router.add_delete("/v1/control/tokens/{id}", handle_tokens_revoke)
     app.router.add_post("/v1/control/password", handle_password_set)
     app.router.add_delete("/v1/control/password", handle_password_clear)
+    app.router.add_post("/v1/control/api-auth", handle_api_auth_set)
     app.router.add_get("/", handle_panel)
-    app.router.add_get("/health", handle_health)
-
     return app
 
 
@@ -466,10 +479,12 @@ async def handle_session(request):
     auth = request.app.get("auth")
     username = auth.get_web_user(request) if auth is not None else None
     web_auth_enabled = bool(auth.web_enabled) if auth is not None else False
+    api_auth_enabled = bool(auth.enabled) if auth is not None else False
     return web.json_response({
         "authenticated": bool(username),
         "username": username,
         "web_auth_enabled": web_auth_enabled,
+        "api_auth_enabled": api_auth_enabled,
     })
 
 
@@ -500,6 +515,17 @@ async def handle_tokens_create(request):
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     return web.json_response({"ok": True, "token": record})
+
+
+async def handle_api_auth_set(request):
+    """POST /v1/control/api-auth — toggle API token requirement."""
+    _require_control_auth(request)
+    auth = request.app.get("auth")
+    if auth is None:
+        return web.json_response({"error": "auth subsystem not configured"}, status=400)
+    body = await request.json()
+    new_state = auth.set_api_auth_enabled(bool(body.get("enabled")))
+    return web.json_response({"ok": True, "api_auth_enabled": new_state})
 
 
 async def handle_password_set(request):

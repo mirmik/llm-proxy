@@ -13,7 +13,7 @@ from llm_proxy.config import load_config
 from llm_proxy.resource_coordinator import ResourceCoordinator
 from llm_proxy.runtime_manager import RuntimeManager
 from llm_proxy.slot_manager import SlotManager
-from llm_proxy.router import create_app
+from llm_proxy.router import create_api_app, create_control_app
 
 
 async def run(config):
@@ -22,11 +22,15 @@ async def run(config):
     sm = SlotManager()
     auth = AuthManager(config)
     coordinator.register("runtime", rm.list_running_on_gpu, rm.stop)
-    app = create_app(rm, sm, auth)
+    api_app = create_api_app(rm, sm, auth)
+    control_app = create_control_app(rm, sm, auth)
 
     listen = config["listen"]
-    host = listen["host"] if isinstance(listen, dict) else "0.0.0.0"
-    port = listen["port"] if isinstance(listen, dict) else listen
+    api_host = listen["host"] if isinstance(listen, dict) else "0.0.0.0"
+    api_port = listen["port"] if isinstance(listen, dict) else listen
+    control_cfg = config.get("control") or {}
+    control_host = control_cfg.get("host") or api_host
+    control_port = control_cfg.get("port") or (api_port + 1)
     tls_cfg = config.get("tls") or {}
     ssl_context = None
     scheme = "http"
@@ -34,20 +38,23 @@ async def run(config):
         ssl_context = make_ssl_context(tls_cfg["cert_file"], tls_cfg["key_file"])
         scheme = "https"
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host, port, ssl_context=ssl_context)
-    await site.start()
-    print(f"  LLM Proxy listening on {scheme}://{host}:{port}")
+    api_runner = web.AppRunner(api_app)
+    control_runner = web.AppRunner(control_app)
+    await api_runner.setup()
+    await control_runner.setup()
+    api_site = web.TCPSite(api_runner, api_host, api_port, ssl_context=ssl_context)
+    control_site = web.TCPSite(control_runner, control_host, control_port, ssl_context=ssl_context)
+    await api_site.start()
+    await control_site.start()
+    print(f"  API:     {scheme}://{api_host}:{api_port}")
+    print(f"  Control: {scheme}://{control_host}:{control_port}")
     print(f"  Runtimes: {rm.available_runtimes()}")
     print(f"  Loaded models: {rm.loaded_models()}")
-    if auth.enabled:
-        print(f"  Control auth: enabled ({auth.state_dir})")
+    print(f"  API auth.enabled: {auth.enabled}; web password set: {auth.web_enabled}")
     if tls_cfg.get("enabled", False):
         print(f"  TLS fingerprint: {certificate_fingerprint(tls_cfg['cert_file'])}")
     asyncio.create_task(rm.autostart())
 
-    # Wait for shutdown signal
     stop = asyncio.Event()
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -56,14 +63,14 @@ async def run(config):
     await stop.wait()
     print("\n  Shutting down...")
 
-    # Save all slot caches before stopping
     for name in rm.loaded_models():
         port = rm.get_port(name)
         if port:
             await sm.save_all(name, port)
 
     await rm.stop_all()
-    await runner.cleanup()
+    await api_runner.cleanup()
+    await control_runner.cleanup()
 
 
 def main():
