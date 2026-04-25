@@ -1,0 +1,696 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-proxy</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-elev: #161b22;
+    --bg-input: #0d1117;
+    --border: #30363d;
+    --border-soft: #21262d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #1f6feb;
+    --accent-hover: #388bfd;
+    --danger: #da3633;
+    --warning: #d29922;
+    --ok: #2ea043;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", system-ui, sans-serif; margin: 0; padding: 0; }
+  body { line-height: 1.45; }
+  a { color: var(--accent); }
+  code, pre { font-family: ui-monospace, "JetBrains Mono", "Cascadia Code", "Consolas", monospace; }
+
+  header {
+    background: var(--bg-elev);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+  }
+  header h1 { font-size: 1.05rem; margin: 0; color: var(--text); font-weight: 600; }
+  nav { display: flex; gap: 4px; flex: 1; }
+  nav .nav-btn {
+    background: transparent; color: var(--text-muted); border: 1px solid transparent;
+    padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.92rem;
+  }
+  nav .nav-btn:hover { color: var(--text); background: rgba(255,255,255,0.03); }
+  nav .nav-btn.active { color: var(--text); background: rgba(255,255,255,0.06); border-color: var(--border-soft); }
+  header .right { display: flex; gap: 8px; align-items: center; }
+
+  main { max-width: 1080px; margin: 0 auto; padding: 24px; }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  .card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 20px;
+  }
+  .card h2 { margin: 0 0 6px; font-size: 1.05rem; font-weight: 600; }
+  .card .hint { color: var(--text-muted); font-size: 0.88rem; margin: 0 0 16px; }
+
+  label { display: block; font-size: 0.82rem; color: var(--text-muted); margin: 0 0 6px; }
+  input, select, textarea {
+    width: 100%;
+    background: var(--bg-input);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font: inherit;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  textarea { font-family: ui-monospace, "JetBrains Mono", monospace; font-size: 0.85rem; }
+
+  .field { margin-bottom: 14px; }
+  .row { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
+  .row > * { flex: 1 1 auto; min-width: 0; }
+  .row .grow { flex: 1 1 100%; }
+
+  button.btn, .actions button {
+    background: var(--accent); color: white; border: 1px solid var(--accent);
+    padding: 8px 16px; border-radius: 6px; cursor: pointer; font: inherit; font-weight: 500;
+  }
+  button.btn:hover, .actions button:hover { background: var(--accent-hover); }
+  button.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.secondary {
+    background: transparent; color: var(--text); border: 1px solid var(--border);
+  }
+  button.secondary:hover { background: rgba(255,255,255,0.04); }
+  button.danger {
+    background: transparent; color: var(--danger); border-color: var(--danger);
+  }
+  button.danger:hover { background: rgba(218, 54, 51, 0.1); }
+  .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+
+  .msg { font-size: 0.85rem; min-height: 1.2em; margin-top: 12px; color: var(--text-muted); }
+  .msg.error { color: var(--danger); }
+  .msg.ok { color: var(--ok); }
+
+  .callout {
+    background: rgba(31, 111, 235, 0.08);
+    border: 1px solid rgba(31, 111, 235, 0.4);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin: 16px 0;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .callout strong { color: var(--text); font-weight: 600; font-size: 0.92rem; }
+  .callout code {
+    display: block;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    word-break: break-all;
+    font-size: 0.85rem;
+  }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.9rem; }
+  thead th { text-align: left; color: var(--text-muted); font-weight: 500; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 8px 6px; border-bottom: 1px solid var(--border-soft); }
+  tbody td { padding: 10px 6px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.mono { font-family: ui-monospace, monospace; color: var(--text-muted); font-size: 0.82rem; }
+  td.actions-cell { text-align: right; }
+  td.actions-cell button { padding: 4px 10px; font-size: 0.82rem; }
+
+  .empty { text-align: center; color: var(--text-muted); padding: 24px; font-size: 0.9rem; }
+
+  .toolbar {
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; gap: 10px; flex-wrap: wrap;
+  }
+  .toolbar h2 { margin: 0; font-size: 1.1rem; }
+  .toolbar .right { display: flex; gap: 8px; }
+
+  /* runtime cards */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+  .runtime-card { background: var(--bg-elev); border: 1px solid var(--border-soft); border-radius: 10px; padding: 16px 18px; display: flex; flex-direction: column; gap: 8px; }
+  .runtime-card .name { font-weight: 600; }
+  .runtime-card .meta { color: var(--text-muted); font-size: 0.82rem; }
+  .runtime-card .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge { font-size: 0.72rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-muted); }
+  .badge.running { color: var(--ok); border-color: rgba(46, 160, 67, 0.5); }
+  .badge.stopped { color: var(--text-muted); }
+  .badge.autoload { color: var(--warning); border-color: rgba(210, 153, 34, 0.5); }
+  .runtime-card .actions { margin-top: auto; }
+  .runtime-card .actions button { padding: 5px 10px; font-size: 0.82rem; }
+  .runtime-card pre.logs { background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; padding: 10px; max-height: 240px; overflow: auto; font-size: 0.78rem; white-space: pre-wrap; margin: 8px 0 0; }
+  .runtime-card .rt-profile { margin-top: 4px; }
+  .runtime-card .rt-settings { margin-top: 4px; border-top: 1px solid var(--border-soft); padding-top: 8px; }
+  .runtime-card .rt-settings > summary { cursor: pointer; color: var(--text-muted); font-size: 0.85rem; padding: 4px 0; user-select: none; }
+  .runtime-card .rt-settings[open] > summary { color: var(--text); }
+  .runtime-card .rt-settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+  .runtime-card .rt-settings-grid .full { grid-column: 1 / -1; }
+  .runtime-card .rt-settings-grid .field { margin-bottom: 0; }
+  .runtime-card .rt-settings-grid label { font-size: 0.75rem; }
+  .runtime-card .rt-settings-grid input,
+  .runtime-card .rt-settings-grid select,
+  .runtime-card .rt-settings-grid textarea { font-size: 0.85rem; padding: 6px 8px; }
+  .runtime-card .rt-settings-grid textarea { font-family: ui-monospace, monospace; font-size: 0.78rem; }
+
+  /* login view: centered */
+  #view-login { display: none; }
+  #view-login.active { display: flex; align-items: center; justify-content: center; min-height: calc(100vh - 80px); }
+  #view-login .card { width: min(360px, 100%); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>llm-proxy</h1>
+  <nav id="topnav">
+    <button class="nav-btn active" data-view="runtimes">Runtimes</button>
+    <button class="nav-btn" data-view="settings">Settings</button>
+  </nav>
+  <div class="right">
+    <button class="secondary" id="logoutBtn" hidden>Logout</button>
+  </div>
+</header>
+
+<main>
+
+  <!-- LOGIN -->
+  <section id="view-login" class="view">
+    <div class="card">
+      <h2>Login</h2>
+      <p class="hint">A password has been set for the web UI.</p>
+      <div class="field">
+        <label>Password</label>
+        <input id="loginPassword" type="password" autocomplete="current-password">
+      </div>
+      <div class="actions">
+        <button class="btn" id="loginBtn">Login</button>
+      </div>
+      <div class="msg" id="loginMsg"></div>
+    </div>
+  </section>
+
+  <!-- RUNTIMES -->
+  <section id="view-runtimes" class="view active">
+    <div class="card">
+      <div class="toolbar">
+        <h2>Managed runtimes</h2>
+        <div class="right">
+          <button class="btn" id="newRuntimeBtn">+ New runtime</button>
+          <button class="secondary" id="refreshBtn">Refresh</button>
+        </div>
+      </div>
+      <div class="msg" id="stateMsg"></div>
+    </div>
+
+    <section class="card" id="newRuntimeForm" hidden>
+      <div class="toolbar">
+        <h2>New runtime</h2>
+        <button class="secondary" id="newRuntimeCloseBtn">Cancel</button>
+      </div>
+      <div class="row" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;">
+        <div class="field"><label>Name *</label><input id="nr-name" placeholder="qwen3.6-27b-q5"></div>
+        <div class="field"><label>Driver</label>
+          <select id="nr-driver">
+            <option value="llama_cpp">llama_cpp</option>
+            <option value="vllm">vllm</option>
+            <option value="custom">custom</option>
+          </select>
+        </div>
+        <div class="field"><label>Kind</label>
+          <select id="nr-kind">
+            <option value="llm">llm</option>
+            <option value="stt">stt</option>
+            <option value="tts">tts</option>
+          </select>
+        </div>
+        <div class="field"><label>GPU group</label><input id="nr-gpu" placeholder="local"></div>
+        <div class="field"><label>Profile name</label><input id="nr-profile" placeholder="default"></div>
+        <div class="field"><label>Autoload</label>
+          <select id="nr-autoload"><option value="false">false</option><option value="true">true</option></select>
+        </div>
+        <div class="field"><label>On Demand</label>
+          <select id="nr-ondemand"><option value="false">false</option><option value="true">true</option></select>
+        </div>
+        <div class="field"><label>Port *</label><input id="nr-port" placeholder="8083"></div>
+        <div class="field" id="nr-slots-wrap"><label>Slots</label><input id="nr-slots" value="1"></div>
+        <div class="field" id="nr-venv-wrap" hidden style="grid-column:1/-1;"><label>Venv (resolves {python})</label><input id="nr-venv" placeholder="~/project/.../venv"></div>
+        <div class="field" style="grid-column:1/-1;">
+          <label>Command * (use {port}, {slots}, {python}, {runners_dir}, {runtime_kv}, {defaults.*})</label>
+          <textarea id="nr-command" rows="6"></textarea>
+        </div>
+        <div class="field" style="grid-column:1/-1;">
+          <label>Env (KEY=value per line)</label>
+          <textarea id="nr-env" rows="3"></textarea>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" id="newRuntimeCreate">Create</button>
+      </div>
+      <div class="msg" id="newRuntimeMsg"></div>
+    </section>
+
+    <div class="grid" id="runtimes"></div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="view-settings" class="view">
+
+    <section class="card">
+      <h2>Web UI password</h2>
+      <p class="hint" id="passwordHint">No password is set — anyone reaching this page has full access.</p>
+      <div class="field" id="passwordCurrentWrap" hidden>
+        <label>Current password</label>
+        <input id="passwordCurrent" type="password" autocomplete="current-password">
+      </div>
+      <div class="field">
+        <label id="passwordNewLabel">Set web UI password</label>
+        <input id="passwordNew" type="password" placeholder="new password" autocomplete="new-password">
+      </div>
+      <div class="actions">
+        <button class="btn" id="passwordSetBtn">Set password</button>
+        <button class="danger" id="passwordClearBtn" hidden>Disable password</button>
+      </div>
+      <div class="msg" id="passwordMsg"></div>
+    </section>
+
+    <section class="card">
+      <h2>API tokens</h2>
+      <p class="hint">Tokens authenticate non-browser clients. Use as <code>Authorization: Bearer &lt;token&gt;</code>. The plain value is shown only once at creation.</p>
+      <div class="row">
+        <div class="field grow"><label>New token name</label><input id="tokenName" placeholder="aionshad / nemor / ..."></div>
+        <div class="field"><label>&nbsp;</label><button class="btn" id="tokenCreateBtn">Create token</button></div>
+      </div>
+      <div class="callout" id="newTokenDisplay" hidden>
+        <strong>Copy this token now — it will not be shown again:</strong>
+        <code id="newTokenValue"></code>
+        <div><button class="secondary" id="newTokenCopyBtn">Copy</button></div>
+      </div>
+      <div class="msg" id="tokenMsg"></div>
+      <table id="tokensTable">
+        <thead><tr><th>Name</th><th>ID</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="tokensEmpty" hidden>No tokens yet.</div>
+    </section>
+
+  </section>
+
+</main>
+
+<script>
+  // ---------- helpers ----------
+  async function api(path, options = {}) {
+    const headers = Object.assign({"Content-Type": "application/json"}, options.headers || {});
+    const resp = await fetch(path, Object.assign({}, options, {headers, credentials: "same-origin"}));
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || resp.statusText || ("HTTP " + resp.status));
+    return data;
+  }
+  function escapeHtml(s) {
+    const d = document.createElement("div"); d.textContent = (s == null ? "" : String(s)); return d.innerHTML;
+  }
+  function shortDate(s) {
+    if (!s) return "—";
+    try { return new Date(s).toLocaleString(); } catch { return s; }
+  }
+  function setMsg(el, text, kind) {
+    el.textContent = text || "";
+    el.className = "msg" + (kind ? " " + kind : "");
+  }
+
+  // ---------- view switcher ----------
+  let webAuthEnabled = false;
+  let webAuthenticated = false;
+  let currentView = "runtimes";
+
+  const navButtons = document.querySelectorAll("#topnav .nav-btn");
+  const views = {
+    login: document.getElementById("view-login"),
+    runtimes: document.getElementById("view-runtimes"),
+    settings: document.getElementById("view-settings"),
+  };
+
+  function showView(name) {
+    if (webAuthEnabled && !webAuthenticated) name = "login";
+    currentView = name;
+    for (const k of Object.keys(views)) views[k].classList.toggle("active", k === name);
+    document.getElementById("topnav").style.visibility = (name === "login") ? "hidden" : "visible";
+    document.getElementById("logoutBtn").hidden = !webAuthenticated;
+    navButtons.forEach(b => b.classList.toggle("active", b.dataset.view === name));
+    if (name === "settings") refreshTokens();
+    if (name === "runtimes") refreshState();
+  }
+
+  navButtons.forEach(b => b.addEventListener("click", () => showView(b.dataset.view)));
+
+  // ---------- session / login ----------
+  const loginPasswordInput = document.getElementById("loginPassword");
+  const loginMsg = document.getElementById("loginMsg");
+  const logoutBtn = document.getElementById("logoutBtn");
+
+  async function checkSession() {
+    try {
+      const data = await api("/session");
+      webAuthEnabled = !!data.web_auth_enabled;
+      webAuthenticated = !!data.authenticated;
+    } catch (e) {
+      webAuthEnabled = false; webAuthenticated = false;
+    }
+    applyPasswordUi();
+    showView(currentView);
+  }
+
+  document.getElementById("loginBtn").addEventListener("click", async () => {
+    setMsg(loginMsg, "");
+    try {
+      await api("/login", {method: "POST", body: JSON.stringify({password: loginPasswordInput.value})});
+      loginPasswordInput.value = "";
+      await checkSession();
+      showView("runtimes");
+    } catch (e) { setMsg(loginMsg, "Login failed: " + e.message, "error"); }
+  });
+  loginPasswordInput.addEventListener("keydown", e => { if (e.key === "Enter") document.getElementById("loginBtn").click(); });
+
+  logoutBtn.addEventListener("click", async () => {
+    try { await api("/logout", {method: "POST"}); } catch {}
+    await checkSession();
+  });
+
+  // ---------- password ----------
+  const passwordHint = document.getElementById("passwordHint");
+  const passwordCurrentWrap = document.getElementById("passwordCurrentWrap");
+  const passwordCurrentInput = document.getElementById("passwordCurrent");
+  const passwordNewInput = document.getElementById("passwordNew");
+  const passwordNewLabel = document.getElementById("passwordNewLabel");
+  const passwordSetBtn = document.getElementById("passwordSetBtn");
+  const passwordClearBtn = document.getElementById("passwordClearBtn");
+  const passwordMsg = document.getElementById("passwordMsg");
+
+  function applyPasswordUi() {
+    passwordCurrentWrap.hidden = !webAuthEnabled;
+    passwordClearBtn.hidden = !webAuthEnabled;
+    passwordSetBtn.textContent = webAuthEnabled ? "Change password" : "Set password";
+    passwordNewLabel.textContent = webAuthEnabled ? "New password" : "Set web UI password";
+    passwordHint.textContent = webAuthEnabled
+      ? "A password is set — login is required for the web UI."
+      : "No password is set — anyone reaching this page has full access.";
+  }
+
+  passwordSetBtn.addEventListener("click", async () => {
+    setMsg(passwordMsg, "");
+    const newPwd = passwordNewInput.value;
+    if (!newPwd) { setMsg(passwordMsg, "Enter a new password.", "error"); return; }
+    const body = {password: newPwd};
+    if (webAuthEnabled) body.current_password = passwordCurrentInput.value;
+    try {
+      await api("/v1/control/password", {method: "POST", body: JSON.stringify(body)});
+      passwordCurrentInput.value = ""; passwordNewInput.value = "";
+      setMsg(passwordMsg, webAuthEnabled ? "Password changed." : "Password set. Web login is now required.", "ok");
+      await checkSession();
+    } catch (e) { setMsg(passwordMsg, "Failed: " + e.message, "error"); }
+  });
+
+  passwordClearBtn.addEventListener("click", async () => {
+    setMsg(passwordMsg, "");
+    const cur = passwordCurrentInput.value;
+    if (!cur) { setMsg(passwordMsg, "Enter the current password to disable.", "error"); return; }
+    if (!confirm("Disable web UI password? Anyone reaching this page will then have full control access.")) return;
+    try {
+      await api("/v1/control/password", {method: "DELETE", body: JSON.stringify({current_password: cur})});
+      passwordCurrentInput.value = ""; passwordNewInput.value = "";
+      setMsg(passwordMsg, "Password cleared. Web UI is open.", "ok");
+      await checkSession();
+    } catch (e) { setMsg(passwordMsg, "Failed: " + e.message, "error"); }
+  });
+
+  // ---------- tokens ----------
+  const tokenNameInput = document.getElementById("tokenName");
+  const tokenMsg = document.getElementById("tokenMsg");
+  const tokensTable = document.getElementById("tokensTable").querySelector("tbody");
+  const tokensEmpty = document.getElementById("tokensEmpty");
+  const newTokenDisplay = document.getElementById("newTokenDisplay");
+  const newTokenValue = document.getElementById("newTokenValue");
+
+  async function refreshTokens() {
+    try {
+      const data = await api("/v1/control/tokens");
+      const tokens = data.tokens || [];
+      tokensTable.innerHTML = "";
+      tokensEmpty.hidden = tokens.length > 0;
+      for (const t of tokens) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${escapeHtml(t.name)}</td>
+          <td class="mono">${escapeHtml(t.id)}</td>
+          <td>${shortDate(t.created_at)}</td>
+          <td>${shortDate(t.last_used_at)}</td>
+          <td class="actions-cell"><button class="danger" data-revoke="${escapeHtml(t.id)}">Revoke</button></td>`;
+        tokensTable.appendChild(tr);
+      }
+    } catch (e) { setMsg(tokenMsg, "Failed to load tokens: " + e.message, "error"); }
+  }
+
+  document.getElementById("tokenCreateBtn").addEventListener("click", async () => {
+    setMsg(tokenMsg, "");
+    newTokenDisplay.hidden = true;
+    const name = tokenNameInput.value.trim();
+    if (!name) { setMsg(tokenMsg, "Enter a name.", "error"); return; }
+    try {
+      const data = await api("/v1/control/tokens", {method: "POST", body: JSON.stringify({name})});
+      tokenNameInput.value = "";
+      newTokenValue.textContent = data.token.token;
+      newTokenDisplay.hidden = false;
+      await refreshTokens();
+    } catch (e) { setMsg(tokenMsg, "Create failed: " + e.message, "error"); }
+  });
+
+  document.getElementById("newTokenCopyBtn").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(newTokenValue.textContent);
+      setMsg(tokenMsg, "Token copied to clipboard.", "ok");
+    } catch (e) { setMsg(tokenMsg, "Copy failed: " + e.message, "error"); }
+  });
+
+  tokensTable.addEventListener("click", async (e) => {
+    const id = e.target.dataset && e.target.dataset.revoke;
+    if (!id) return;
+    if (!confirm("Revoke this token? Clients using it will stop working immediately.")) return;
+    try {
+      await api("/v1/control/tokens/" + encodeURIComponent(id), {method: "DELETE"});
+      newTokenDisplay.hidden = true;
+      await refreshTokens();
+    } catch (e2) { setMsg(tokenMsg, "Revoke failed: " + e2.message, "error"); }
+  });
+
+  // ---------- runtimes ----------
+  const runtimesEl = document.getElementById("runtimes");
+  const stateMsg = document.getElementById("stateMsg");
+  const newRuntimeForm = document.getElementById("newRuntimeForm");
+  const newRuntimeMsg = document.getElementById("newRuntimeMsg");
+
+  async function refreshState() {
+    try {
+      const data = await api("/v1/control/state");
+      runtimesEl.innerHTML = "";
+      const list = data.runtimes || [];
+      for (const r of list) renderRuntimeCard(r);
+      if (!list.length) {
+        runtimesEl.innerHTML = `<div class="empty">No runtimes configured.</div>`;
+      }
+    } catch (e) { setMsg(stateMsg, "Failed: " + e.message, "error"); }
+  }
+
+  function formatEnv(env) {
+    if (!env || typeof env !== "object") return "";
+    return Object.keys(env).map(k => `${k}=${env[k]}`).join("\n");
+  }
+
+  function renderRuntimeCard(r) {
+    const div = document.createElement("div");
+    div.className = "runtime-card";
+    const running = r.running || r.status === "running";
+    const settings = r.settings || {};
+    const kind = r.kind || settings.kind || "llm";
+    const profile = r.profile || r.default_profile || "default";
+    const port = settings.port ?? r.port ?? "—";
+    const profiles = r.profiles || [];
+    const badges = [];
+    badges.push(`<span class="badge ${running ? "running" : "stopped"}">${running ? "running" : "stopped"}</span>`);
+    badges.push(`<span class="badge">${escapeHtml(kind)}</span>`);
+    if (settings.autoload) badges.push(`<span class="badge autoload">autoload</span>`);
+    if (settings.on_demand) badges.push(`<span class="badge">on-demand</span>`);
+    if (r.gpu) badges.push(`<span class="badge">gpu: ${escapeHtml(r.gpu)}</span>`);
+    const profileSel = profiles.length > 1
+      ? `<div class="rt-profile field">
+           <label>Active profile</label>
+           <select data-profile-select="${escapeHtml(r.name)}">
+             ${profiles.map(p => `<option value="${escapeHtml(p)}" ${p === profile ? "selected" : ""}>${escapeHtml(p)}</option>`).join("")}
+           </select>
+         </div>` : "";
+    const slotsField = (kind === "llm")
+      ? `<div class="field"><label>Slots</label><input data-setting="slots" data-name="${escapeHtml(r.name)}" value="${escapeHtml(String(settings.slots ?? ""))}"></div>`
+      : "";
+    const venvField = (kind !== "llm")
+      ? `<div class="field"><label>Venv</label><input data-setting="venv" data-name="${escapeHtml(r.name)}" value="${escapeHtml(String(settings.venv ?? ""))}" placeholder="~/path/to/venv (resolves {python})"></div>`
+      : "";
+    div.innerHTML = `
+      <div class="name">${escapeHtml(r.name)}</div>
+      <div class="badges">${badges.join("")}</div>
+      <div class="meta">profile: ${escapeHtml(profile)} · port: ${escapeHtml(String(port))} · driver: ${escapeHtml(r.driver || "—")}${r.health_url ? " · health: " + escapeHtml(r.health_url) : ""}</div>
+      ${profileSel}
+      <div class="actions">
+        ${running
+          ? `<button class="danger" data-action="stop" data-name="${escapeHtml(r.name)}">Stop</button>`
+          : `<button class="btn" data-action="start" data-name="${escapeHtml(r.name)}">Start</button>`}
+        <button class="secondary" data-action="logs" data-name="${escapeHtml(r.name)}">Logs</button>
+        <button class="danger secondary" data-action="delete" data-name="${escapeHtml(r.name)}">Delete</button>
+      </div>
+      <details class="rt-settings">
+        <summary>Settings</summary>
+        <div class="rt-settings-grid">
+          <div class="field"><label>Autoload</label>
+            <select data-setting="autoload" data-name="${escapeHtml(r.name)}">
+              <option value="true" ${settings.autoload ? "selected" : ""}>true</option>
+              <option value="false" ${!settings.autoload ? "selected" : ""}>false</option>
+            </select>
+          </div>
+          <div class="field"><label>On Demand</label>
+            <select data-setting="on_demand" data-name="${escapeHtml(r.name)}">
+              <option value="true" ${settings.on_demand ? "selected" : ""}>true</option>
+              <option value="false" ${!settings.on_demand ? "selected" : ""}>false</option>
+            </select>
+          </div>
+          <div class="field"><label>Port</label><input data-setting="port" data-name="${escapeHtml(r.name)}" value="${escapeHtml(String(settings.port ?? ""))}"></div>
+          ${slotsField}
+          ${venvField}
+          <div class="field"><label>Startup timeout (s)</label><input data-setting="startup_timeout" data-name="${escapeHtml(r.name)}" value="${escapeHtml(String(settings.startup_timeout ?? ""))}" placeholder="default 120"></div>
+          <div class="field full"><label>Command</label><textarea data-setting="command" data-name="${escapeHtml(r.name)}" rows="5">${escapeHtml(settings.command ?? "")}</textarea></div>
+          <div class="field full"><label>Env (KEY=value per line)</label><textarea data-setting="env" data-name="${escapeHtml(r.name)}" rows="3">${escapeHtml(formatEnv(settings.env))}</textarea></div>
+        </div>
+        <div class="actions">
+          <button class="btn" data-action="save-settings" data-name="${escapeHtml(r.name)}">Save settings</button>
+        </div>
+      </details>
+      <pre class="logs" id="logs-${escapeHtml(r.name)}" hidden></pre>`;
+    runtimesEl.appendChild(div);
+  }
+
+  runtimesEl.addEventListener("click", async (e) => {
+    const t = e.target;
+    const action = t.dataset && t.dataset.action;
+    const name = t.dataset && t.dataset.name;
+    if (!action || !name) return;
+    try {
+      if (action === "start") {
+        await api(`/v1/control/runtimes/${encodeURIComponent(name)}/start`, {method: "POST"});
+        await refreshState();
+      } else if (action === "stop") {
+        await api(`/v1/control/runtimes/${encodeURIComponent(name)}/stop`, {method: "POST"});
+        await refreshState();
+      } else if (action === "delete") {
+        if (!confirm(`Delete runtime "${name}"?`)) return;
+        await api(`/v1/control/runtimes/${encodeURIComponent(name)}/delete`, {method: "POST"});
+        await refreshState();
+      } else if (action === "logs") {
+        const data = await api(`/v1/control/runtimes/${encodeURIComponent(name)}/logs`);
+        const pre = document.getElementById(`logs-${name}`);
+        pre.textContent = (data.logs || []).join("\n") || "(no logs)";
+        pre.hidden = !pre.hidden;
+      } else if (action === "save-settings") {
+        const fields = document.querySelectorAll(`[data-setting][data-name="${CSS.escape(name)}"]`);
+        const settings = {};
+        for (const f of fields) {
+          const key = f.dataset.setting;
+          let value = f.value;
+          if (key === "autoload" || key === "on_demand") value = (value === "true");
+          settings[key] = value;
+        }
+        await api(`/v1/control/runtimes/${encodeURIComponent(name)}/settings`, {
+          method: "POST",
+          body: JSON.stringify({settings}),
+        });
+        setMsg(stateMsg, `Saved settings for ${name}.`, "ok");
+        await refreshState();
+      }
+    } catch (err) { setMsg(stateMsg, action + " failed: " + err.message, "error"); }
+  });
+
+  runtimesEl.addEventListener("change", async (e) => {
+    const sel = e.target.dataset && e.target.dataset.profileSelect;
+    if (!sel) return;
+    try {
+      await api(`/v1/control/runtimes/${encodeURIComponent(sel)}/select-profile`, {
+        method: "POST",
+        body: JSON.stringify({profile: e.target.value}),
+      });
+      setMsg(stateMsg, `Switched profile for ${sel} to ${e.target.value}.`, "ok");
+      await refreshState();
+    } catch (err) { setMsg(stateMsg, "Profile switch failed: " + err.message, "error"); }
+  });
+
+  document.getElementById("refreshBtn").addEventListener("click", refreshState);
+
+  // ---------- new runtime form ----------
+  const newRuntimeBtn = document.getElementById("newRuntimeBtn");
+  const newRuntimeCloseBtn = document.getElementById("newRuntimeCloseBtn");
+  const nrDriver = document.getElementById("nr-driver");
+  const nrVenvWrap = document.getElementById("nr-venv-wrap");
+  const nrSlotsWrap = document.getElementById("nr-slots-wrap");
+
+  function syncDriverFields() {
+    const d = nrDriver.value;
+    nrVenvWrap.hidden = !(d === "vllm" || d === "custom");
+    nrSlotsWrap.hidden = (d === "stt" || d === "tts");
+  }
+  nrDriver.addEventListener("change", syncDriverFields);
+
+  newRuntimeBtn.addEventListener("click", () => {
+    newRuntimeForm.hidden = !newRuntimeForm.hidden;
+    if (!newRuntimeForm.hidden) syncDriverFields();
+  });
+  newRuntimeCloseBtn.addEventListener("click", () => { newRuntimeForm.hidden = true; });
+
+  document.getElementById("newRuntimeCreate").addEventListener("click", async () => {
+    setMsg(newRuntimeMsg, "");
+    const name = document.getElementById("nr-name").value.trim();
+    const command = document.getElementById("nr-command").value;
+    const port = document.getElementById("nr-port").value.trim();
+    if (!name || !command || !port) { setMsg(newRuntimeMsg, "name, port and command are required.", "error"); return; }
+    const env = {};
+    for (const line of document.getElementById("nr-env").value.split("\n")) {
+      const m = line.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (m) env[m[1]] = m[2];
+    }
+    const body = {
+      name,
+      driver: nrDriver.value,
+      kind: document.getElementById("nr-kind").value,
+      gpu: document.getElementById("nr-gpu").value || "local",
+      autoload: document.getElementById("nr-autoload").value === "true",
+      on_demand: document.getElementById("nr-ondemand").value === "true",
+      profile: {
+        name: document.getElementById("nr-profile").value || "default",
+        port: parseInt(port, 10),
+        slots: parseInt(document.getElementById("nr-slots").value || "1", 10),
+        venv: document.getElementById("nr-venv").value || null,
+        command,
+        env,
+      },
+    };
+    try {
+      await api("/v1/control/runtimes", {method: "POST", body: JSON.stringify(body)});
+      setMsg(newRuntimeMsg, "Created.", "ok");
+      newRuntimeForm.hidden = true;
+      await refreshState();
+    } catch (e) { setMsg(newRuntimeMsg, "Create failed: " + e.message, "error"); }
+  });
+
+  // ---------- init ----------
+  checkSession();
+</script>
+</body>
+</html>

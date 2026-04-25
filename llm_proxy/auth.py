@@ -30,9 +30,13 @@ class AuthManager:
         self.enabled = bool(((config.get("auth") or {}).get("enabled", False)))
         self.state_dir = os.path.expanduser(config["state_dir"])
         self.web_auth_cfg = config.get("web_auth") or {}
-        self.web_enabled = bool(self.web_auth_cfg.get("enabled", False))
         self._sessions = {}
         self._session_cookie = "llm_proxy_session"
+
+    @property
+    def web_enabled(self):
+        """Web login is required iff a password has been set via the UI."""
+        return os.path.isfile(self._web_password_path())
 
     # ---- token CRUD ----
 
@@ -107,26 +111,39 @@ class AuthManager:
             return None
         return session.get("username")
 
-    def web_login(self, username, password):
-        username = (username or "").strip()
+    def web_login(self, password):
         password = password or ""
-        if not username or not password:
-            raise PermissionError("username and password are required")
-        user = None
-        for candidate in self.web_auth_cfg.get("users", []):
-            if candidate.get("username") == username:
-                user = candidate
-                break
-        if not user or not self._verify_web_password(user, password):
-            raise PermissionError("invalid username or password")
+        if not password:
+            raise PermissionError("password is required")
+        if not self._verify_stored_web_password(password):
+            raise PermissionError("invalid password")
         session_id = self._generate_hex(48)
         ttl_hours = float(self.web_auth_cfg.get("session_ttl_hours", 168))
         self._sessions[session_id] = {
-            "username": username,
+            "username": "admin",
             "created_at": self._now(),
             "expires_at": (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat(),
         }
         return session_id
+
+    def set_web_password(self, new_password, current_password=None):
+        new_password = new_password or ""
+        if len(new_password) < 4:
+            raise ValueError("password must be at least 4 characters")
+        if self.web_enabled:
+            if not current_password or not self._verify_stored_web_password(current_password):
+                raise PermissionError("current password is required to change it")
+        self._write_web_password(new_password)
+
+    def clear_web_password(self, current_password=None):
+        if not self.web_enabled:
+            return False
+        if not current_password or not self._verify_stored_web_password(current_password):
+            raise PermissionError("current password is required to clear it")
+        path = self._web_password_path()
+        if os.path.isfile(path):
+            os.remove(path)
+        return True
 
     def web_logout(self, request):
         session_id = request.cookies.get(self._session_cookie)
@@ -177,19 +194,36 @@ class AuthManager:
             return record
         return None
 
-    def _verify_web_password(self, user, password):
-        plain = user.get("password")
-        if plain is not None:
-            return secrets.compare_digest(str(plain), password)
-        salt_b64 = user.get("salt")
-        password_hash_b64 = user.get("password_hash")
-        if not salt_b64 or not password_hash_b64:
+    def _verify_stored_web_password(self, password):
+        path = self._web_password_path()
+        if not os.path.isfile(path):
             return False
-        salt = base64.b64decode(salt_b64)
-        expected = base64.b64decode(password_hash_b64)
-        iterations = int(user.get("iterations", 600_000))
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        salt = base64.b64decode(payload["salt"])
+        expected = base64.b64decode(payload["password_hash"])
+        iterations = int(payload.get("iterations", 600_000))
         actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
         return secrets.compare_digest(actual, expected)
+
+    def _write_web_password(self, password, *, iterations=600_000):
+        salt = secrets.token_bytes(16)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        payload = {
+            "salt": base64.b64encode(salt).decode("ascii"),
+            "password_hash": base64.b64encode(digest).decode("ascii"),
+            "iterations": iterations,
+            "updated_at": self._now(),
+        }
+        path = self._web_password_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+
+    def _web_password_path(self):
+        return os.path.join(self.state_dir, "web_password.json")
 
     def _tokens_path(self):
         return os.path.join(self.state_dir, "auth_tokens.json")

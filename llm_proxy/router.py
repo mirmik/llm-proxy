@@ -1,6 +1,7 @@
 """Router — OpenAI-compatible proxy with model routing and session awareness."""
 
 import json
+import os
 
 import aiohttp
 from aiohttp import web
@@ -39,6 +40,8 @@ def create_app(runtime_manager, slot_manager, auth_manager=None):
     app.router.add_get("/v1/control/tokens", handle_tokens_list)
     app.router.add_post("/v1/control/tokens", handle_tokens_create)
     app.router.add_delete("/v1/control/tokens/{id}", handle_tokens_revoke)
+    app.router.add_post("/v1/control/password", handle_password_set)
+    app.router.add_delete("/v1/control/password", handle_password_clear)
     app.router.add_get("/", handle_panel)
     app.router.add_get("/health", handle_health)
 
@@ -76,6 +79,7 @@ async def _ensure_slot(rm, sm, model_name, session_id, port):
 
 async def handle_chat(request):
     """Proxy /v1/chat/completions to the right llama-server backend."""
+    _require_client_auth(request)
     rm = request.app["rm"]
     sm = request.app["sm"]
 
@@ -428,14 +432,14 @@ def _require_client_auth(request):
 async def handle_login(request):
     auth = request.app.get("auth")
     if auth is None or not auth.web_enabled:
-        return web.json_response({"error": "web auth is disabled"}, status=400)
+        return web.json_response({"error": "no password is set"}, status=400)
     body = await request.json()
     try:
-        session_id = auth.web_login(body.get("username", ""), body.get("password", ""))
+        session_id = auth.web_login(body.get("password", ""))
     except PermissionError as e:
         return web.json_response({"error": str(e)}, status=401)
 
-    response = web.json_response({"ok": True, "username": body.get("username", "").strip()})
+    response = web.json_response({"ok": True})
     response.set_cookie(
         auth.session_cookie_name(),
         session_id,
@@ -461,7 +465,12 @@ async def handle_logout(request):
 async def handle_session(request):
     auth = request.app.get("auth")
     username = auth.get_web_user(request) if auth is not None else None
-    return web.json_response({"authenticated": bool(username), "username": username})
+    web_auth_enabled = bool(auth.web_enabled) if auth is not None else False
+    return web.json_response({
+        "authenticated": bool(username),
+        "username": username,
+        "web_auth_enabled": web_auth_enabled,
+    })
 
 
 async def handle_control_whoami(request):
@@ -491,6 +500,47 @@ async def handle_tokens_create(request):
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     return web.json_response({"ok": True, "token": record})
+
+
+async def handle_password_set(request):
+    """POST /v1/control/password — set/change UI password.
+
+    Body: {password, current_password?}. current_password required iff one is already set.
+    Setting a password enables the login screen for the web UI.
+    """
+    _require_control_auth(request)
+    auth = request.app.get("auth")
+    if auth is None:
+        return web.json_response({"error": "auth subsystem not configured"}, status=400)
+    body = await request.json()
+    try:
+        auth.set_web_password(
+            body.get("password", ""),
+            current_password=body.get("current_password"),
+        )
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except PermissionError as e:
+        return web.json_response({"error": str(e)}, status=403)
+    return web.json_response({"ok": True, "web_auth_enabled": auth.web_enabled})
+
+
+async def handle_password_clear(request):
+    """DELETE /v1/control/password — remove UI password (open access via web)."""
+    _require_control_auth(request)
+    auth = request.app.get("auth")
+    if auth is None:
+        return web.json_response({"error": "auth subsystem not configured"}, status=400)
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    try:
+        cleared = auth.clear_web_password(current_password=body.get("current_password"))
+    except PermissionError as e:
+        return web.json_response({"error": str(e)}, status=403)
+    return web.json_response({"ok": True, "cleared": cleared, "web_auth_enabled": auth.web_enabled})
 
 
 async def handle_tokens_revoke(request):
@@ -656,576 +706,6 @@ async def handle_panel(request):
 
 
 def _panel_html():
-    return """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>llm-proxy control</title>
-  <style>
-    :root {
-      --bg: #f5efe2;
-      --paper: #fffaf0;
-      --ink: #1e1b18;
-      --muted: #6d655d;
-      --accent: #0f766e;
-      --accent-2: #b45309;
-      --line: #d8ccb8;
-      --ok: #166534;
-      --warn: #92400e;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Iosevka Aile", "IBM Plex Sans", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(180,83,9,0.15), transparent 24rem),
-        linear-gradient(135deg, #efe2c6, var(--bg));
-    }
-    header {
-      padding: 24px 28px 12px;
-    }
-    h1 {
-      margin: 0;
-      font-size: 2rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
-    .sub {
-      color: var(--muted);
-      margin-top: 6px;
-    }
-    .wrap {
-      display: grid;
-      grid-template-columns: 320px 1fr;
-      gap: 20px;
-      padding: 12px 28px 28px;
-    }
-    .card {
-      background: rgba(255,250,240,0.9);
-      border: 1px solid var(--line);
-      border-radius: 20px;
-      padding: 18px;
-      box-shadow: 0 12px 40px rgba(30,27,24,0.08);
-      backdrop-filter: blur(8px);
-    }
-    .auth-grid {
-      display: grid;
-      gap: 10px;
-    }
-    .stack {
-      display: grid;
-      gap: 14px;
-    }
-    label {
-      font-size: 0.85rem;
-      text-transform: uppercase;
-      color: var(--muted);
-      letter-spacing: 0.08em;
-    }
-    input, select, button, textarea {
-      width: 100%;
-      padding: 10px 12px;
-      border-radius: 12px;
-      border: 1px solid var(--line);
-      font: inherit;
-      background: #fffdfa;
-      color: var(--ink);
-    }
-    button {
-      cursor: pointer;
-      background: var(--ink);
-      color: white;
-      border: none;
-      transition: transform 120ms ease, opacity 120ms ease;
-    }
-    button:hover { transform: translateY(-1px); }
-    button.secondary { background: var(--accent); }
-    button.warning { background: var(--accent-2); }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
-      gap: 16px;
-      align-content: start;
-    }
-    .status {
-      display: inline-block;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-size: 0.8rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      background: #ebe4d6;
-      color: var(--warn);
-    }
-    .status.running {
-      background: rgba(22,101,52,0.12);
-      color: var(--ok);
-    }
-    .actions {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 8px;
-      margin-top: 12px;
-    }
-    .settings-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 8px;
-      margin-top: 12px;
-    }
-    .settings-grid .full {
-      grid-column: 1 / -1;
-    }
-    .meta {
-      color: var(--muted);
-      font-size: 0.9rem;
-      margin-top: 8px;
-      display: grid;
-      gap: 4px;
-    }
-    pre {
-      margin: 10px 0 0;
-      background: #1c1917;
-      color: #f8f5ef;
-      padding: 12px;
-      border-radius: 14px;
-      max-height: 220px;
-      overflow: auto;
-      font-family: "Iosevka", monospace;
-      font-size: 0.85rem;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .toolbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 14px;
-      gap: 10px;
-    }
-    .message {
-      color: var(--muted);
-      min-height: 1.4em;
-      font-size: 0.92rem;
-    }
-    @media (max-width: 920px) {
-      .wrap { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>llm-proxy control</h1>
-    <div class="sub">Unified local control plane for LLM, STT, and TTS runtimes.</div>
-  </header>
-  <div class="wrap">
-    <section class="card stack">
-      <div>
-        <label>Username</label>
-        <input id="username" placeholder="mirmik">
-      </div>
-      <div>
-        <label>Password</label>
-        <input id="password" type="password" placeholder="password">
-      </div>
-      <div class="auth-grid">
-        <button id="loginBtn">Login</button>
-        <button class="secondary" id="logoutBtn">Logout</button>
-      </div>
-      <div class="message" id="authMsg"></div>
-      <div class="meta">
-        <div>Browser UI uses a cookie-backed session.</div>
-        <div>Machine clients continue to use host tokens.</div>
-      </div>
-    </section>
-    <section class="stack">
-      <div class="card">
-        <div class="toolbar">
-          <strong>Managed Runtimes</strong>
-          <div style="display:flex; gap:8px;">
-            <button id="newRuntimeBtn" style="width:auto;padding:10px 18px;">+ New Runtime</button>
-            <button class="secondary" id="refreshBtn" style="width:auto;padding:10px 18px;">Refresh</button>
-          </div>
-        </div>
-        <div class="message" id="stateMsg"></div>
-      </div>
-      <section class="card" id="newRuntimeForm" hidden>
-        <div class="toolbar">
-          <strong>Create Runtime</strong>
-          <button class="warning" id="newRuntimeCancel" style="width:auto;padding:6px 12px;">Cancel</button>
-        </div>
-        <div class="settings-grid" style="margin-top:12px;">
-          <div>
-            <label>Name *</label>
-            <input id="nr-name" placeholder="my-runtime">
-          </div>
-          <div>
-            <label>Driver *</label>
-            <select id="nr-driver">
-              <option value="llama_cpp">llama_cpp (LLM)</option>
-              <option value="faster_whisper">faster_whisper (STT)</option>
-              <option value="xtts">xtts (TTS)</option>
-            </select>
-          </div>
-          <div>
-            <label>GPU</label>
-            <input id="nr-gpu" placeholder="local">
-          </div>
-          <div>
-            <label>Profile name</label>
-            <input id="nr-profile" placeholder="default">
-          </div>
-          <div>
-            <label>Autoload</label>
-            <select id="nr-autoload">
-              <option value="false">false</option>
-              <option value="true">true</option>
-            </select>
-          </div>
-          <div>
-            <label>On Demand</label>
-            <select id="nr-ondemand">
-              <option value="false">false</option>
-              <option value="true">true</option>
-            </select>
-          </div>
-          <div>
-            <label>Port *</label>
-            <input id="nr-port" placeholder="8083">
-          </div>
-          <div id="nr-slots-wrap">
-            <label>Slots</label>
-            <input id="nr-slots" value="1">
-          </div>
-          <div class="full" id="nr-venv-wrap" hidden>
-            <label>Venv (resolves {python})</label>
-            <input id="nr-venv" placeholder="~/project/.../venv">
-          </div>
-          <div class="full">
-            <label>Command * (use {port}, {slots}, {python}, {runners_dir}, {runtime_kv}, {defaults.*})</label>
-            <textarea id="nr-command" rows="6" spellcheck="false" style="font-family:monospace;font-size:0.85rem;"></textarea>
-          </div>
-          <div class="full">
-            <label>Env (KEY=value per line)</label>
-            <textarea id="nr-env" rows="3" spellcheck="false" style="font-family:monospace;font-size:0.85rem;"></textarea>
-          </div>
-          <div class="full">
-            <button class="secondary" id="newRuntimeCreate">Create</button>
-          </div>
-          <div class="full message" id="newRuntimeMsg"></div>
-        </div>
-      </section>
-      <div class="grid" id="runtimes"></div>
-    </section>
-  </div>
-  <script>
-    const usernameInput = document.getElementById('username');
-    const passwordInput = document.getElementById('password');
-    const authMsg = document.getElementById('authMsg');
-    const stateMsg = document.getElementById('stateMsg');
-    const runtimesEl = document.getElementById('runtimes');
-
-    async function api(path, options = {}) {
-      const headers = Object.assign({}, options.headers || {});
-      if (options.body && !headers['Content-Type']) {
-        headers['Content-Type'] = 'application/json';
-      }
-      const resp = await fetch(path, Object.assign({}, options, {headers, credentials: 'same-origin'}));
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok) {
-        throw new Error(data.error || resp.statusText);
-      }
-      return data;
-    }
-
-    async function checkAuth() {
-      try {
-        const data = await api('/session');
-        authMsg.textContent = data.authenticated ? ('Logged in as ' + data.username) : 'Not logged in.';
-      } catch (e) {
-        authMsg.textContent = 'Auth failed: ' + e.message;
-      }
-    }
-
-    async function login() {
-      try {
-        const data = await api('/login', {
-          method: 'POST',
-          body: JSON.stringify({username: usernameInput.value.trim(), password: passwordInput.value}),
-        });
-        passwordInput.value = '';
-        authMsg.textContent = 'Logged in as ' + data.username;
-        await refreshState();
-      } catch (e) {
-        authMsg.textContent = 'Login failed: ' + e.message;
-      }
-    }
-
-    async function logout() {
-      try {
-        await api('/logout', {method: 'POST'});
-        authMsg.textContent = 'Logged out.';
-        await refreshState();
-      } catch (e) {
-        authMsg.textContent = 'Logout failed: ' + e.message;
-      }
-    }
-
-    function runtimeCard(runtime) {
-      const running = runtime.status === 'running';
-      const options = (runtime.profiles || []).map((profile) =>
-        `<option value="${escapeHtml(profile)}" ${profile === runtime.profile ? 'selected' : ''}>${escapeHtml(profile)}</option>`
-      ).join('');
-      const llmAction = runtime.kind === 'llm'
-        ? `<button data-action="${running ? 'unload-model' : 'load-model'}" data-name="${escapeHtml(runtime.name)}">${running ? 'Unload' : 'Load'}</button>`
-        : `<button disabled>${escapeHtml(runtime.kind)}</button>`;
-      const settings = runtime.settings || {};
-      return `<article class="card">
-        <div class="toolbar">
-          <strong>${escapeHtml(runtime.name)}</strong>
-          <span class="status ${running ? 'running' : ''}">${escapeHtml(runtime.status)}</span>
-        </div>
-        <div class="meta">
-          <div>driver: ${escapeHtml(runtime.driver || '—')}</div>
-          <div>kind: ${escapeHtml(runtime.kind || 'runtime')}</div>
-          <div>profile: ${escapeHtml(runtime.profile || '—')}</div>
-          <div>port: ${escapeHtml(runtime.port || '—')}</div>
-          <div>gpu: ${escapeHtml(runtime.gpu || '—')}</div>
-          <div>autoload: ${runtime.autoload ? 'yes' : 'no'} / on-demand: ${runtime.on_demand ? 'yes' : 'no'}</div>
-          <div>health: ${escapeHtml(runtime.health_url || '—')}</div>
-        </div>
-        ${runtime.profiles && runtime.profiles.length ? `
-          <div style="margin-top:12px;">
-            <label>Profile</label>
-            <select data-profile-select="${escapeHtml(runtime.name)}">${options}</select>
-          </div>` : ''}
-        <div class="actions">
-          <button class="secondary" data-action="start-runtime" data-name="${escapeHtml(runtime.name)}">Start</button>
-          <button class="warning" data-action="stop-runtime" data-name="${escapeHtml(runtime.name)}">Stop</button>
-          ${llmAction}
-        </div>
-        <div class="settings-grid">
-          <div>
-            <label>Autoload</label>
-            <select data-setting="autoload" data-name="${escapeHtml(runtime.name)}">
-              <option value="true" ${settings.autoload ? 'selected' : ''}>true</option>
-              <option value="false" ${!settings.autoload ? 'selected' : ''}>false</option>
-            </select>
-          </div>
-          <div>
-            <label>On Demand</label>
-            <select data-setting="on_demand" data-name="${escapeHtml(runtime.name)}">
-              <option value="true" ${settings.on_demand ? 'selected' : ''}>true</option>
-              <option value="false" ${!settings.on_demand ? 'selected' : ''}>false</option>
-            </select>
-          </div>
-          <div>
-            <label>Port</label>
-            <input data-setting="port" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.port ?? '')}">
-          </div>
-          ${settings.kind === 'llm' ? `
-          <div>
-            <label>Slots</label>
-            <input data-setting="slots" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.slots ?? '')}">
-          </div>
-          <div>
-            <label>Startup Timeout (s)</label>
-            <input data-setting="startup_timeout" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.startup_timeout ?? '')}" placeholder="default 120">
-          </div>
-          ` : `
-          <div>
-            <label>Venv</label>
-            <input data-setting="venv" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.venv ?? '')}" placeholder="~/path/to/venv (resolves {python})">
-          </div>
-          <div>
-            <label>Startup Timeout (s)</label>
-            <input data-setting="startup_timeout" data-name="${escapeHtml(runtime.name)}" value="${escapeHtml(settings.startup_timeout ?? '')}" placeholder="default 120/240">
-          </div>
-          `}
-          <div class="full">
-            <label>Command</label>
-            <textarea data-setting="command" data-name="${escapeHtml(runtime.name)}" rows="6" spellcheck="false" style="font-family:monospace;font-size:0.85rem;">${escapeHtml(settings.command ?? '')}</textarea>
-          </div>
-          <div class="full">
-            <label>Env (KEY=value per line)</label>
-            <textarea data-setting="env" data-name="${escapeHtml(runtime.name)}" rows="3" spellcheck="false" style="font-family:monospace;font-size:0.85rem;">${escapeHtml(formatEnv(settings.env))}</textarea>
-          </div>
-          <div class="full">
-            <button class="secondary" data-action="save-settings" data-name="${escapeHtml(runtime.name)}">Save Settings</button>
-          </div>
-        </div>
-        <button style="margin-top:10px;background:#44403c;" data-action="logs-runtime" data-name="${escapeHtml(runtime.name)}">Show Logs</button>
-        <pre id="logs-${escapeHtml(runtime.name)}" hidden></pre>
-        <div style="margin-top:8px; display:flex; justify-content:flex-end;">
-          <button class="warning" style="width:auto; padding:6px 14px; font-size:0.82rem;" data-action="delete-runtime" data-name="${escapeHtml(runtime.name)}">Delete</button>
-        </div>
-      </article>`;
-    }
-
-    async function refreshState() {
-      try {
-        const data = await api('/v1/control/state');
-        runtimesEl.innerHTML = data.runtimes.map(runtimeCard).join('');
-        stateMsg.textContent = `runtimes: ${data.runtimes.length}, llm: ${data.models.length}`;
-      } catch (e) {
-        runtimesEl.innerHTML = '';
-        stateMsg.textContent = 'Failed to load state: ' + e.message;
-      }
-    }
-
-    async function showLogs(name) {
-      const data = await api('/v1/control/runtimes/' + encodeURIComponent(name) + '/logs');
-      const pre = document.getElementById('logs-' + name);
-      pre.hidden = false;
-      pre.textContent = (data.logs || []).join('\\n');
-    }
-
-    async function saveSettings(name) {
-      const fields = document.querySelectorAll(`[data-setting][data-name="${CSS.escape(name)}"]`);
-      const settings = {};
-      for (const field of fields) {
-        let value = field.value;
-        const key = field.dataset.setting;
-        if (key === 'autoload' || key === 'on_demand') {
-          value = value === 'true';
-        }
-        settings[key] = value;
-      }
-      await api('/v1/control/runtimes/' + encodeURIComponent(name) + '/settings', {
-        method: 'POST',
-        body: JSON.stringify({settings}),
-      });
-    }
-
-    function formatEnv(env) {
-      if (!env || typeof env !== 'object') return '';
-      return Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\\n');
-    }
-
-    function escapeHtml(value) {
-      return String(value)
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;');
-    }
-
-    document.getElementById('loginBtn').addEventListener('click', login);
-    document.getElementById('logoutBtn').addEventListener('click', logout);
-    document.getElementById('refreshBtn').addEventListener('click', refreshState);
-
-    const newRuntimeForm = document.getElementById('newRuntimeForm');
-    const newRuntimeMsg = document.getElementById('newRuntimeMsg');
-
-    document.getElementById('newRuntimeBtn').addEventListener('click', () => {
-      newRuntimeForm.hidden = !newRuntimeForm.hidden;
-      if (!newRuntimeForm.hidden) {
-        newRuntimeMsg.textContent = '';
-        document.getElementById('nr-name').focus();
-      }
-    });
-    document.getElementById('newRuntimeCancel').addEventListener('click', () => {
-      newRuntimeForm.hidden = true;
-    });
-    document.getElementById('nr-driver').addEventListener('change', updateDriverFields);
-    function updateDriverFields() {
-      const driver = document.getElementById('nr-driver').value;
-      const isLlama = driver === 'llama_cpp';
-      document.getElementById('nr-slots-wrap').hidden = !isLlama;
-      document.getElementById('nr-venv-wrap').hidden = isLlama;
-    }
-    updateDriverFields();
-
-    document.getElementById('newRuntimeCreate').addEventListener('click', async () => {
-      newRuntimeMsg.textContent = '';
-      const driver = document.getElementById('nr-driver').value;
-      const profile = {
-        port: document.getElementById('nr-port').value.trim(),
-        command: document.getElementById('nr-command').value,
-      };
-      if (driver === 'llama_cpp') {
-        const slots = document.getElementById('nr-slots').value.trim();
-        if (slots) profile.slots = parseInt(slots, 10);
-      } else {
-        const venv = document.getElementById('nr-venv').value.trim();
-        if (venv) profile.venv = venv;
-      }
-      const envText = document.getElementById('nr-env').value.trim();
-      if (envText) profile.env = envText;
-
-      const body = {
-        name: document.getElementById('nr-name').value.trim(),
-        driver,
-        gpu: document.getElementById('nr-gpu').value.trim() || null,
-        autoload: document.getElementById('nr-autoload').value === 'true',
-        on_demand: document.getElementById('nr-ondemand').value === 'true',
-        profile_name: document.getElementById('nr-profile').value.trim() || 'default',
-        profile,
-      };
-      try {
-        await api('/v1/control/runtimes', {
-          method: 'POST',
-          body: JSON.stringify(body),
-        });
-        newRuntimeForm.hidden = true;
-        [
-          'nr-name','nr-gpu','nr-profile','nr-port','nr-venv','nr-command','nr-env'
-        ].forEach((id) => { document.getElementById(id).value = ''; });
-        document.getElementById('nr-slots').value = '1';
-        await refreshState();
-      } catch (e) {
-        newRuntimeMsg.textContent = 'Create failed: ' + e.message;
-      }
-    });
-
-    checkAuth();
-    document.addEventListener('click', async (event) => {
-      const target = event.target.closest('[data-action]');
-      if (!target) return;
-      const action = target.dataset.action;
-      const name = target.dataset.name;
-      try {
-        if (action === 'load-model') {
-          await api('/v1/control/models/' + encodeURIComponent(name) + '/load', {method: 'POST'});
-        } else if (action === 'unload-model') {
-          await api('/v1/control/models/' + encodeURIComponent(name) + '/unload', {method: 'POST'});
-        } else if (action === 'start-runtime') {
-          await api('/v1/control/runtimes/' + encodeURIComponent(name) + '/start', {method: 'POST'});
-        } else if (action === 'stop-runtime') {
-          await api('/v1/control/runtimes/' + encodeURIComponent(name) + '/stop', {method: 'POST'});
-        } else if (action === 'logs-runtime') {
-          await showLogs(name);
-          return;
-        } else if (action === 'save-settings') {
-          await saveSettings(name);
-        } else if (action === 'delete-runtime') {
-          if (!confirm(`Delete runtime '${name}'? This removes it from config.yaml and stops the process if running.`)) return;
-          await api('/v1/control/runtimes/' + encodeURIComponent(name) + '/delete', {method: 'POST'});
-        }
-        await refreshState();
-      } catch (e) {
-        stateMsg.textContent = 'Action failed: ' + e.message;
-      }
-    });
-
-    document.addEventListener('change', async (event) => {
-      const select = event.target.closest('[data-profile-select]');
-      if (!select) return;
-      const name = select.dataset.profileSelect;
-      try {
-        await api('/v1/control/runtimes/' + encodeURIComponent(name) + '/select-profile', {
-          method: 'POST',
-          body: JSON.stringify({profile: select.value}),
-        });
-        await refreshState();
-      } catch (e) {
-        stateMsg.textContent = 'Profile switch failed: ' + e.message;
-      }
-    });
-
-    refreshState();
-  </script>
-</body>
-</html>"""
+    path = os.path.join(os.path.dirname(__file__), "panel.html")
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
