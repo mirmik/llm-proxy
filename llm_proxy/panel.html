@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>llm-proxy</title>
 <style>
-  :root {
+  :root,
+  body.theme-dark {
     --bg: #0d1117;
     --bg-elev: #161b22;
     --bg-input: #0d1117;
@@ -18,9 +19,36 @@
     --danger: #da3633;
     --warning: #d29922;
     --ok: #2ea043;
+    --body-bg: var(--bg);
+  }
+  body.theme-classic {
+    --bg: #f5efe2;
+    --bg-elev: #fffaf0;
+    --bg-input: #fffdfa;
+    --border: #d8ccb8;
+    --border-soft: #e6dcc8;
+    --text: #1e1b18;
+    --text-muted: #6d655d;
+    --accent: #0f766e;
+    --accent-hover: #14958c;
+    --danger: #b91c1c;
+    --warning: #b45309;
+    --ok: #166534;
+    --body-bg:
+      radial-gradient(circle at top left, rgba(180,83,9,0.15), transparent 24rem),
+      linear-gradient(135deg, #efe2c6, #f5efe2);
   }
   * { box-sizing: border-box; }
-  html, body { background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", system-ui, sans-serif; margin: 0; padding: 0; }
+  html, body { margin: 0; padding: 0; }
+  html { background: #0d1117; }
+  body { background: var(--body-bg); color: var(--text); font-family: -apple-system, "Segoe UI", system-ui, sans-serif; min-height: 100vh; background-attachment: fixed; }
+  body.theme-classic { font-family: "Iosevka Aile", "IBM Plex Sans", system-ui, sans-serif; }
+  body.theme-classic header h1 { letter-spacing: 0.04em; text-transform: uppercase; font-size: 1.2rem; }
+  body.theme-classic .card { border-radius: 18px; box-shadow: 0 12px 40px rgba(30,27,24,0.08); }
+  body.theme-classic input,
+  body.theme-classic select,
+  body.theme-classic textarea { border-radius: 10px; }
+  body.theme-classic .callout { background: rgba(15, 118, 110, 0.08); border-color: rgba(15, 118, 110, 0.4); }
   body { line-height: 1.45; }
   a { color: var(--accent); }
   code, pre { font-family: ui-monospace, "JetBrains Mono", "Cascadia Code", "Consolas", monospace; }
@@ -42,6 +70,7 @@
   nav .nav-btn:hover { color: var(--text); background: rgba(255,255,255,0.03); }
   nav .nav-btn.active { color: var(--text); background: rgba(255,255,255,0.06); border-color: var(--border-soft); }
   header .right { display: flex; gap: 8px; align-items: center; }
+  .theme-select { width: auto; padding: 4px 8px; font-size: 0.85rem; background: transparent; color: var(--text-muted); border: 1px solid var(--border-soft); border-radius: 6px; }
 
   main { max-width: 1080px; margin: 0 auto; padding: 24px; }
   .view { display: none; }
@@ -171,6 +200,10 @@
     <button class="nav-btn" data-view="settings">Settings</button>
   </nav>
   <div class="right">
+    <select id="themeSelect" class="theme-select" title="Theme">
+      <option value="dark">Dark</option>
+      <option value="classic">Classic</option>
+    </select>
     <button class="secondary" id="logoutBtn" hidden>Logout</button>
   </div>
 </header>
@@ -321,6 +354,18 @@
     el.textContent = text || "";
     el.className = "msg" + (kind ? " " + kind : "");
   }
+
+  // ---------- theme ----------
+  const themeSelect = document.getElementById("themeSelect");
+  function applyTheme(name) {
+    if (name !== "classic" && name !== "dark") name = "dark";
+    document.body.classList.remove("theme-dark", "theme-classic");
+    document.body.classList.add("theme-" + name);
+    themeSelect.value = name;
+    try { localStorage.setItem("llm-proxy-theme", name); } catch {}
+  }
+  applyTheme(localStorage.getItem("llm-proxy-theme") || "dark");
+  themeSelect.addEventListener("change", () => applyTheme(themeSelect.value));
 
   // ---------- view switcher ----------
   let webAuthEnabled = false;
