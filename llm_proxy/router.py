@@ -6,6 +6,9 @@ import os
 import aiohttp
 from aiohttp import web
 
+from llm_proxy.certs import certificate_fingerprint, generate_server_cert
+from llm_proxy.config import load_config_file, save_config_file
+
 
 def _setup_app(rm, sm, auth, routes=None):
     app = web.Application()
@@ -63,6 +66,9 @@ def create_control_app(runtime_manager, slot_manager, auth_manager=None, route_m
     app.router.add_delete("/v1/control/routes/{name}", handle_routes_delete)
     app.router.add_post("/v1/control/routes/{name}/backends", handle_routes_add_backend)
     app.router.add_delete("/v1/control/routes/{name}/backends/{index}", handle_routes_remove_backend)
+    app.router.add_get("/v1/control/tls", handle_tls_status)
+    app.router.add_post("/v1/control/tls", handle_tls_toggle)
+    app.router.add_post("/v1/control/tls/generate-cert", handle_tls_generate_cert)
     app.router.add_get("/", handle_panel)
     return app
 
@@ -1001,6 +1007,86 @@ async def handle_routes_remove_backend(request):
         return web.json_response({"error": str(e)}, status=400)
     route = route_manager.get_route(name)
     return web.json_response({"ok": True, "route": route.status() if route else None, "removed_index": index})
+
+
+async def handle_tls_status(request):
+    _require_control_auth(request)
+    config = request.app.get("config") or {}
+    tls_cfg = config.get("tls") or {}
+    cert_file = os.path.expanduser(tls_cfg.get("cert_file", ""))
+    cert_exists = os.path.isfile(cert_file)
+    fingerprint = None
+    if cert_exists:
+        try:
+            fingerprint = certificate_fingerprint(cert_file)
+        except Exception:
+            pass
+    return web.json_response({
+        "enabled": bool(tls_cfg.get("enabled", False)),
+        "cert_file": cert_file,
+        "key_file": os.path.expanduser(tls_cfg.get("key_file", "")),
+        "cert_exists": cert_exists,
+        "fingerprint": fingerprint,
+    })
+
+
+async def handle_tls_toggle(request):
+    _require_control_auth(request)
+    config = request.app.get("config") or {}
+    body = await request.json()
+    desired = bool(body.get("enabled", False))
+
+    config_path = config.get("_config_path")
+    if not config_path:
+        config_path = os.path.expanduser("~/.config/llm-proxy/config.yaml")
+
+    current = load_config_file(config_path)
+    current.setdefault("tls", {})["enabled"] = desired
+    save_config_file(config_path, current)
+
+    config["tls"] = config.get("tls") or {}
+    config["tls"]["enabled"] = desired
+
+    return web.json_response({
+        "ok": True,
+        "enabled": desired,
+        "restart_needed": True,
+    })
+
+
+async def handle_tls_generate_cert(request):
+    _require_control_auth(request)
+    config = request.app.get("config") or {}
+    body = await request.json()
+    host = body.get("host", "llm-proxy")
+    ip = body.get("ip")
+
+    state_dir = config.get("state_dir", "~/.config/llm-proxy")
+    generated = generate_server_cert(state_dir, host=host, ip=ip)
+
+    config_path = config.get("_config_path")
+    if not config_path:
+        config_path = os.path.expanduser("~/.config/llm-proxy/config.yaml")
+
+    current = load_config_file(config_path)
+    current.setdefault("tls", {})["cert_file"] = generated["cert"]
+    current.setdefault("tls", {})["key_file"] = generated["key"]
+    current.setdefault("tls", {})["enabled"] = True
+    save_config_file(config_path, current)
+
+    config["tls"] = config.get("tls") or {}
+    config["tls"]["cert_file"] = generated["cert"]
+    config["tls"]["key_file"] = generated["key"]
+    config["tls"]["enabled"] = True
+
+    return web.json_response({
+        "ok": True,
+        "cert_file": generated["cert"],
+        "key_file": generated["key"],
+        "fingerprint": generated["fingerprint"],
+        "enabled": True,
+        "restart_needed": True,
+    })
 
 
 async def handle_panel(request):

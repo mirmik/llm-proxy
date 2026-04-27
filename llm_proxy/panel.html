@@ -338,6 +338,33 @@
       <div class="empty" id="tokensEmpty" hidden>No tokens yet.</div>
     </section>
 
+    <section class="card">
+      <h2>HTTPS / TLS</h2>
+      <p class="hint">Encrypt the API port with HTTPS. The control panel stays on plain HTTP. Changes require a restart to take effect.</p>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+        <span id="tlsStatusBadge" style="font-size:0.85rem;padding:4px 10px;border-radius:999px;border:1px solid var(--border);">HTTP</span>
+        <span id="tlsFingerprint" style="font-size:0.78rem;color:var(--text-muted);"></span>
+      </div>
+      <div class="row" style="align-items:center;margin-bottom:12px;">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
+          <input type="checkbox" id="tlsToggle" style="width:auto;">
+          <span>Enable HTTPS on API port</span>
+        </label>
+      </div>
+      <div class="field">
+        <label>Hostname for certificate</label>
+        <input id="tlsCertHost" value="" placeholder="llm-proxy">
+      </div>
+      <div class="field">
+        <label>IP (optional)</label>
+        <input id="tlsCertIp" value="" placeholder="192.168.1.100">
+      </div>
+      <div class="actions">
+        <button class="btn" id="tlsGenCertBtn">Generate certificate</button>
+      </div>
+      <div class="msg" id="tlsMsg"></div>
+    </section>
+
   </section>
 
   <!-- ROUTING -->
@@ -437,7 +464,7 @@
     document.getElementById("topnav").style.visibility = (name === "login") ? "hidden" : "visible";
     document.getElementById("logoutBtn").hidden = !webAuthenticated;
     navButtons.forEach(b => b.classList.toggle("active", b.dataset.view === name));
-    if (name === "settings") refreshTokens();
+    if (name === "settings") { refreshTokens(); refreshTls(); }
     if (name === "runtimes") refreshState();
     if (name === "routing") refreshRoutes();
   }
@@ -990,6 +1017,75 @@
       document.getElementById("nrt-name").value = "";
       await refreshRoutes();
     } catch (e) { setMsg(newRouteMsg, "Create failed: " + e.message, "error"); }
+  });
+
+  // ---------- TLS ----------
+  const tlsToggle = document.getElementById("tlsToggle");
+  const tlsMsg = document.getElementById("tlsMsg");
+  const tlsStatusBadge = document.getElementById("tlsStatusBadge");
+  const tlsFingerprint = document.getElementById("tlsFingerprint");
+  const tlsCertHost = document.getElementById("tlsCertHost");
+  const tlsCertIp = document.getElementById("tlsCertIp");
+
+  async function refreshTls() {
+    try {
+      const data = await api("/v1/control/tls");
+      tlsToggle.checked = data.enabled;
+      if (data.enabled) {
+        tlsStatusBadge.textContent = "HTTPS";
+        tlsStatusBadge.style.color = "var(--ok)";
+        tlsStatusBadge.style.borderColor = "rgba(46, 160, 67, 0.5)";
+      } else {
+        tlsStatusBadge.textContent = "HTTP";
+        tlsStatusBadge.style.color = "var(--text-muted)";
+        tlsStatusBadge.style.borderColor = "var(--border)";
+      }
+      tlsFingerprint.textContent = data.fingerprint ? "fingerprint: " + data.fingerprint : "";
+    } catch (e) {
+      setMsg(tlsMsg, "Failed to load TLS status: " + e.message, "error");
+    }
+  }
+
+  tlsToggle.addEventListener("change", async (e) => {
+    const desired = e.target.checked;
+    setMsg(tlsMsg, "");
+    try {
+      const data = await api("/v1/control/tls", {
+        method: "POST",
+        body: JSON.stringify({enabled: desired}),
+      });
+      tlsToggle.checked = data.enabled;
+      refreshTls();
+      setMsg(tlsMsg, data.enabled
+        ? "HTTPS enabled in config. Restart llm-proxy for the change to take effect."
+        : "HTTP restored in config. Restart llm-proxy for the change to take effect.",
+        "ok");
+    } catch (err) {
+      tlsToggle.checked = !desired;
+      setMsg(tlsMsg, "Failed: " + err.message, "error");
+    }
+  });
+
+  document.getElementById("tlsGenCertBtn").addEventListener("click", async () => {
+    setMsg(tlsMsg, "");
+    const host = tlsCertHost.value.trim() || "llm-proxy";
+    const ip = tlsCertIp.value.trim() || null;
+    const body = {host};
+    if (ip) body.ip = ip;
+    try {
+      const data = await api("/v1/control/tls/generate-cert", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      tlsFingerprint.textContent = "fingerprint: " + data.fingerprint;
+      tlsToggle.checked = true;
+      tlsStatusBadge.textContent = "HTTPS";
+      tlsStatusBadge.style.color = "var(--ok)";
+      tlsStatusBadge.style.borderColor = "rgba(46, 160, 67, 0.5)";
+      setMsg(tlsMsg, "Certificate generated. HTTPS enabled in config. Restart llm-proxy for the change to take effect.", "ok");
+    } catch (err) {
+      setMsg(tlsMsg, "Failed: " + err.message, "error");
+    }
   });
 
   // ---------- init ----------

@@ -26,6 +26,8 @@ async def run(config):
     coordinator.register("runtime", rm.list_running_on_gpu, rm.stop)
     api_app = create_api_app(rm, sm, auth, route_manager=routes)
     control_app = create_control_app(rm, sm, auth, route_manager=routes)
+    api_app["config"] = config
+    control_app["config"] = config
 
     listen = config["listen"]
     api_host = listen["host"] if isinstance(listen, dict) else "0.0.0.0"
@@ -34,22 +36,22 @@ async def run(config):
     control_host = control_cfg.get("host") or api_host
     control_port = control_cfg.get("port") or (api_port + 1)
     tls_cfg = config.get("tls") or {}
-    ssl_context = None
-    scheme = "http"
+    api_ssl_context = None
+    api_scheme = "http"
     if tls_cfg.get("enabled", False):
-        ssl_context = make_ssl_context(tls_cfg["cert_file"], tls_cfg["key_file"])
-        scheme = "https"
+        api_ssl_context = make_ssl_context(tls_cfg["cert_file"], tls_cfg["key_file"])
+        api_scheme = "https"
 
     api_runner = web.AppRunner(api_app)
     control_runner = web.AppRunner(control_app)
     await api_runner.setup()
     await control_runner.setup()
-    api_site = web.TCPSite(api_runner, api_host, api_port, ssl_context=ssl_context)
-    control_site = web.TCPSite(control_runner, control_host, control_port, ssl_context=ssl_context)
+    api_site = web.TCPSite(api_runner, api_host, api_port, ssl_context=api_ssl_context)
+    control_site = web.TCPSite(control_runner, control_host, control_port)
     await api_site.start()
     await control_site.start()
-    print(f"  API:     {scheme}://{api_host}:{api_port}")
-    print(f"  Control: {scheme}://{control_host}:{control_port}")
+    print(f"  API:     {api_scheme}://{api_host}:{api_port}")
+    print(f"  Control: http://{control_host}:{control_port}")
     print(f"  Runtimes: {rm.available_runtimes()}")
     print(f"  Loaded models: {rm.loaded_models()}")
     print(f"  API auth.enabled: {auth.enabled}; web password set: {auth.web_enabled}")
