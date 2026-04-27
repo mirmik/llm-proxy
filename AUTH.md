@@ -63,7 +63,7 @@ Clients send a single header:
 Authorization: Bearer lp_<id>_<secret>
 ```
 
-The same token works for both inference (`/v1/chat/completions`, `/v1/audio/speech`, `/stt`) and control (`/v1/control/...`, `/v1/models/.../load`).
+The same token works for inference (`/v1/chat/completions`, `/v1/audio/speech`, `/stt`). Model load/unload is control-plane only (`/v1/control/models/.../load`, `/v1/control/models/.../unload`).
 
 ## State files
 

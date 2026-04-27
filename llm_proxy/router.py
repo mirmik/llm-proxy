@@ -28,8 +28,6 @@ def create_api_app(runtime_manager, slot_manager, auth_manager=None, route_manag
     app.router.add_get("/tts/health", handle_tts_health)
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_get("/v1/models", handle_models)
-    app.router.add_post("/v1/models/{name}/load", handle_load)
-    app.router.add_post("/v1/models/{name}/unload", handle_unload)
     app.router.add_get("/health", handle_health)
     return app
 
@@ -305,7 +303,7 @@ async def handle_models(request):
 
 
 async def handle_load(request):
-    """POST /v1/models/{name}/load — explicitly load a model."""
+    """POST /v1/control/models/{name}/load — explicitly load a model."""
     _require_control_auth(request)
     rm = request.app["rm"]
     name = request.match_info["name"]
@@ -319,7 +317,7 @@ async def handle_load(request):
 
 
 async def handle_unload(request):
-    """POST /v1/models/{name}/unload — stop a model."""
+    """POST /v1/control/models/{name}/unload — stop a model."""
     _require_control_auth(request)
     rm = request.app["rm"]
     sm = request.app["sm"]
