@@ -384,11 +384,7 @@
 
 <script>
   // ---------- helpers ----------
-  const basePath = (() => {
-    const p = window.location.pathname.replace(/\/panel\.html$/, "").replace(/\/$/, "");
-    const i = p.lastIndexOf("/");
-    return i < 0 ? "" : p.substring(0, i);
-  })();
+  const basePath = window.location.pathname.replace(/\/$/, "");
   async function api(path, options = {}) {
     const headers = Object.assign({"Content-Type": "application/json"}, options.headers || {});
     const resp = await fetch(basePath + path, Object.assign({}, options, {headers, credentials: "same-origin"}));
