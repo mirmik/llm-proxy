@@ -197,6 +197,7 @@
   <h1>llm-proxy</h1>
   <nav id="topnav">
     <button class="nav-btn active" data-view="runtimes">Runtimes</button>
+    <button class="nav-btn" data-view="routing">Routing</button>
     <button class="nav-btn" data-view="settings">Settings</button>
   </nav>
   <div class="right">
@@ -339,6 +340,46 @@
 
   </section>
 
+  <!-- ROUTING -->
+  <section id="view-routing" class="view">
+    <div class="card">
+      <div class="toolbar">
+        <h2>Routes</h2>
+        <div class="right">
+          <button class="btn" id="newRouteBtn">+ New route</button>
+          <button class="secondary" id="refreshRoutesBtn">Refresh</button>
+        </div>
+      </div>
+      <div class="msg" id="routeMsg"></div>
+    </div>
+
+    <section class="card" id="newRouteForm" hidden>
+      <div class="toolbar">
+        <h2>New route</h2>
+        <button class="secondary" id="newRouteCloseBtn">Cancel</button>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;">
+        <div class="field"><label>Route name (model name) *</label><input id="nrt-name" placeholder="qwen3.5-122b"></div>
+        <div class="field"><label>Kind</label>
+          <select id="nrt-kind">
+            <option value="llm">llm</option>
+            <option value="stt">stt</option>
+            <option value="tts">tts</option>
+          </select>
+        </div>
+        <div class="field"><label>Health path</label><input id="nrt-health-path" value="/health"></div>
+        <div class="field"><label>Health timeout (s)</label><input id="nrt-health-timeout" value="2.0"></div>
+        <div class="field" style="grid-column:1/-1;"><label>Check interval (s)</label><input id="nrt-check-interval" value="5.0"></div>
+      </div>
+      <div class="actions">
+        <button class="btn" id="newRouteCreate">Create route</button>
+      </div>
+      <div class="msg" id="newRouteMsg"></div>
+    </section>
+
+    <div id="routesContainer"></div>
+  </section>
+
 </main>
 
 <script>
@@ -384,6 +425,7 @@
   const views = {
     login: document.getElementById("view-login"),
     runtimes: document.getElementById("view-runtimes"),
+    routing: document.getElementById("view-routing"),
     settings: document.getElementById("view-settings"),
   };
 
@@ -396,6 +438,7 @@
     navButtons.forEach(b => b.classList.toggle("active", b.dataset.view === name));
     if (name === "settings") refreshTokens();
     if (name === "runtimes") refreshState();
+    if (name === "routing") refreshRoutes();
   }
 
   navButtons.forEach(b => b.addEventListener("click", () => showView(b.dataset.view)));
@@ -787,6 +830,165 @@
       newRuntimeForm.hidden = true;
       await refreshState();
     } catch (e) { setMsg(newRuntimeMsg, "Create failed: " + e.message, "error"); }
+  });
+
+  // ---------- routing ----------
+  const routesContainer = document.getElementById("routesContainer");
+  const routeMsg = document.getElementById("routeMsg");
+  const newRouteForm = document.getElementById("newRouteForm");
+  const newRouteMsg = document.getElementById("newRouteMsg");
+
+  function healthDot(healthy) {
+    if (healthy === true) return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--ok);" title="healthy"></span>`;
+    if (healthy === false) return `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--danger);" title="unhealthy"></span>`;
+    return `<span style="color:var(--text-muted);" title="unknown">—</span>`;
+  }
+
+  async function refreshRoutes() {
+    try {
+      const data = await api("/v1/control/routes");
+      routesContainer.innerHTML = "";
+      const list = data.routes || [];
+      for (const r of list) renderRouteCard(r);
+      if (!list.length) {
+        routesContainer.innerHTML = `<div class="empty">No routes configured. Add a route to forward requests to remote backends.</div>`;
+      }
+    } catch (e) { setMsg(routeMsg, "Failed: " + e.message, "error"); }
+  }
+
+  function renderRouteCard(route) {
+    const div = document.createElement("div");
+    div.className = "card";
+    const backends = route.backends || [];
+    let rows = "";
+    backends.forEach((b, i) => {
+      rows += `<tr>
+        <td>${i}</td>
+        <td class="mono">${escapeHtml(b.url)}</td>
+        <td>${escapeHtml(b.model || route.name)}</td>
+        <td>${escapeHtml(b.auth || "—")}</td>
+        <td>${healthDot(b.healthy)}</td>
+        <td>${b.latency_ms != null ? b.latency_ms + " ms" : "—"}</td>
+        <td class="actions-cell"><button class="danger" data-route-action="rm-backend" data-route="${escapeHtml(route.name)}" data-index="${i}">Remove</button></td>
+      </tr>`;
+    });
+
+    div.innerHTML = `
+      <div class="toolbar">
+        <h2>${escapeHtml(route.name)} <span class="badge">${escapeHtml(route.kind)}</span></h2>
+        <div class="right">
+          <button class="secondary" data-route-action="add-backend-form" data-route="${escapeHtml(route.name)}">+ Add backend</button>
+          <button class="danger" data-route-action="delete-route" data-route="${escapeHtml(route.name)}">Delete route</button>
+        </div>
+      </div>
+      <div style="margin-bottom:8px;font-size:0.82rem;color:var(--text-muted);">
+        Active: <code>${escapeHtml(route.active_url || "—")}</code> · Health path: <code>${escapeHtml(route.health_path)}</code> · Check interval: ${escapeHtml(String(route.check_interval))}s
+      </div>
+      <table>
+        <thead><tr><th>#</th><th>URL</th><th>Model</th><th>Auth</th><th>OK?</th><th>Latency</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="7" class="empty">No backends configured.</td></tr>'}</tbody>
+      </table>
+      <div class="add-backend-form" data-route="${escapeHtml(route.name)}" hidden style="margin-top:12px;padding:12px;border:1px solid var(--border-soft);border-radius:8px;">
+        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;">
+          <div class="field" style="grid-column:1/-1;"><label>URL *</label><input class="ab-url" placeholder="http://192.168.1.100:8080"></div>
+          <div class="field"><label>Model override</label><input class="ab-model" placeholder="${escapeHtml(route.name)}"></div>
+          <div class="field"><label>Auth host name</label><input class="ab-auth" placeholder="remote-cluster"></div>
+        </div>
+        <div class="actions">
+          <button class="btn" data-route-action="add-backend-save" data-route="${escapeHtml(route.name)}">Add</button>
+          <button class="secondary" data-route-action="add-backend-cancel" data-route="${escapeHtml(route.name)}">Cancel</button>
+        </div>
+      </div>
+      <div class="msg" id="routeMsg-${escapeHtml(route.name)}"></div>`;
+    routesContainer.appendChild(div);
+  }
+
+  routesContainer.addEventListener("click", async (e) => {
+    const t = e.target;
+    const action = t.dataset && t.dataset.routeAction;
+    const routeName = t.dataset && t.dataset.route;
+    if (!action || !routeName) return;
+
+    if (action === "delete-route") {
+      if (!confirm(`Delete route "${routeName}"?`)) return;
+      try {
+        await api(`/v1/control/routes/${encodeURIComponent(routeName)}`, {method: "DELETE"});
+        setMsg(routeMsg, `Deleted route ${routeName}.`, "ok");
+        await refreshRoutes();
+      } catch (err) { setMsg(routeMsg, "Delete failed: " + err.message, "error"); }
+      return;
+    }
+
+    if (action === "rm-backend") {
+      const idx = t.dataset.index;
+      if (!confirm(`Remove backend #${idx} from "${routeName}"?`)) return;
+      try {
+        await api(`/v1/control/routes/${encodeURIComponent(routeName)}/backends/${idx}`, {method: "DELETE"});
+        await refreshRoutes();
+      } catch (err) { setMsg(routeMsg, "Remove failed: " + err.message, "error"); }
+      return;
+    }
+
+    if (action === "add-backend-form") {
+      const form = document.querySelector(`.add-backend-form[data-route="${CSS.escape(routeName)}"]`);
+      if (form) form.hidden = !form.hidden;
+      return;
+    }
+
+    if (action === "add-backend-cancel") {
+      const form = document.querySelector(`.add-backend-form[data-route="${CSS.escape(routeName)}"]`);
+      if (form) form.hidden = true;
+      return;
+    }
+
+    if (action === "add-backend-save") {
+      const form = document.querySelector(`.add-backend-form[data-route="${CSS.escape(routeName)}"]`);
+      if (!form) return;
+      const url = form.querySelector(".ab-url").value.trim();
+      const model = form.querySelector(".ab-model").value.trim();
+      const auth = form.querySelector(".ab-auth").value.trim();
+      if (!url) { setMsg(document.getElementById(`routeMsg-${routeName}`), "URL is required.", "error"); return; }
+      const body = {url};
+      if (model) body.model = model;
+      if (auth) body.auth = auth;
+      try {
+        await api(`/v1/control/routes/${encodeURIComponent(routeName)}/backends`, {method: "POST", body: JSON.stringify(body)});
+        form.hidden = true;
+        await refreshRoutes();
+      } catch (err) { setMsg(document.getElementById(`routeMsg-${routeName}`), "Add failed: " + err.message, "error"); }
+      return;
+    }
+  });
+
+  document.getElementById("refreshRoutesBtn").addEventListener("click", refreshRoutes);
+
+  // ---------- new route form ----------
+  document.getElementById("newRouteBtn").addEventListener("click", () => {
+    newRouteForm.hidden = !newRouteForm.hidden;
+  });
+  document.getElementById("newRouteCloseBtn").addEventListener("click", () => {
+    newRouteForm.hidden = true;
+  });
+
+  document.getElementById("newRouteCreate").addEventListener("click", async () => {
+    setMsg(newRouteMsg, "");
+    const name = document.getElementById("nrt-name").value.trim();
+    if (!name) { setMsg(newRouteMsg, "Route name is required.", "error"); return; }
+    const body = {
+      name,
+      kind: document.getElementById("nrt-kind").value,
+      health_path: document.getElementById("nrt-health-path").value || "/health",
+      health_timeout: parseFloat(document.getElementById("nrt-health-timeout").value) || 2.0,
+      check_interval: parseFloat(document.getElementById("nrt-check-interval").value) || 5.0,
+      backends: [],
+    };
+    try {
+      await api("/v1/control/routes", {method: "POST", body: JSON.stringify(body)});
+      setMsg(newRouteMsg, "Created. Add backends to this route.", "ok");
+      newRouteForm.hidden = true;
+      document.getElementById("nrt-name").value = "";
+      await refreshRoutes();
+    } catch (e) { setMsg(newRouteMsg, "Create failed: " + e.message, "error"); }
   });
 
   // ---------- init ----------

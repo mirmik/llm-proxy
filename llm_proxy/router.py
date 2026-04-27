@@ -7,17 +7,18 @@ import aiohttp
 from aiohttp import web
 
 
-def _setup_app(rm, sm, auth):
+def _setup_app(rm, sm, auth, routes=None):
     app = web.Application()
     app["rm"] = rm
     app["sm"] = sm
     app["auth"] = auth
+    app["routes"] = routes
     return app
 
 
-def create_api_app(runtime_manager, slot_manager, auth_manager=None):
+def create_api_app(runtime_manager, slot_manager, auth_manager=None, route_manager=None):
     """Public API surface: inference + discovery. Token-gated when auth.enabled."""
-    app = _setup_app(runtime_manager, slot_manager, auth_manager)
+    app = _setup_app(runtime_manager, slot_manager, auth_manager, routes=route_manager)
     app.router.add_post("/stt", handle_stt_proxy)
     app.router.add_get("/stt/health", handle_stt_health)
     app.router.add_post("/v1/audio/speech", handle_tts_proxy)
@@ -30,12 +31,12 @@ def create_api_app(runtime_manager, slot_manager, auth_manager=None):
     return app
 
 
-def create_control_app(runtime_manager, slot_manager, auth_manager=None):
+def create_control_app(runtime_manager, slot_manager, auth_manager=None, route_manager=None):
     """Control plane: web UI + runtime/token/password management.
 
     Open by default. Set a web password to require login.
     """
-    app = _setup_app(runtime_manager, slot_manager, auth_manager)
+    app = _setup_app(runtime_manager, slot_manager, auth_manager, routes=route_manager)
     app.router.add_post("/login", handle_login)
     app.router.add_post("/logout", handle_logout)
     app.router.add_get("/session", handle_session)
@@ -57,21 +58,39 @@ def create_control_app(runtime_manager, slot_manager, auth_manager=None):
     app.router.add_post("/v1/control/password", handle_password_set)
     app.router.add_delete("/v1/control/password", handle_password_clear)
     app.router.add_post("/v1/control/api-auth", handle_api_auth_set)
+    app.router.add_get("/v1/control/routes", handle_routes_list)
+    app.router.add_post("/v1/control/routes", handle_routes_create)
+    app.router.add_delete("/v1/control/routes/{name}", handle_routes_delete)
+    app.router.add_post("/v1/control/routes/{name}/backends", handle_routes_add_backend)
+    app.router.add_delete("/v1/control/routes/{name}/backends/{index}", handle_routes_remove_backend)
     app.router.add_get("/", handle_panel)
     return app
 
 
-def _resolve_model(rm, model_name):
+def _resolve_model(rm, model_name, route_manager=None):
     """Resolve model name, allowing partial matches. Returns (name, error_response)."""
     models = rm.available_models()
     if model_name in models:
         return model_name, None
+    if route_manager and route_manager.get_route(model_name):
+        return model_name, None
     matched = [m for m in models if model_name in m]
     if len(matched) == 1:
         return matched[0], None
+
+    if route_manager:
+        route_name, route_err = route_manager.resolve_model(model_name)
+        if route_err:
+            return None, web.json_response({"error": route_err}, status=400)
+        if route_name:
+            return route_name, None
+
     if not matched:
+        all_models = list(models)
+        if route_manager:
+            all_models.extend(route_manager.available_routes())
         return None, web.json_response(
-            {"error": f"Unknown model: {model_name}. Available: {models}"},
+            {"error": f"Unknown model: {model_name}. Available: {all_models}"},
             status=404,
         )
     return None, web.json_response(
@@ -91,19 +110,25 @@ async def _ensure_slot(rm, sm, model_name, session_id, port):
 
 
 async def handle_chat(request):
-    """Proxy /v1/chat/completions to the right llama-server backend."""
+    """Proxy /v1/chat/completions to the right backend (routed or local)."""
     _require_client_auth(request)
     rm = request.app["rm"]
     sm = request.app["sm"]
+    route_manager = request.app.get("routes")
 
     body = await request.json()
     model_name = body.get("model", "")
     session_id = body.pop("session_id", None)
     stream = body.get("stream", False)
 
-    model_name, err = _resolve_model(rm, model_name)
+    model_name, err = _resolve_model(rm, model_name, route_manager=route_manager)
     if err:
         return err
+
+    if route_manager:
+        route = route_manager.get_route(model_name)
+        if route:
+            return await _proxy_routed(request, route, body, stream)
 
     if not rm.is_running(model_name):
         if rm.on_demand(model_name):
@@ -139,18 +164,87 @@ async def handle_chat(request):
         return await _proxy_json(backend_url, body)
 
 
-async def _proxy_json(url, body):
+async def _proxy_routed(request, route, body, stream):
+    """Forward request through a Route's failover chain."""
+    from llm_proxy.route_manager import _derive_endpoint_url
+
+    candidates = route.failover_candidates()
+    last_err = None
+    for backend in candidates:
+        url = _derive_endpoint_url(backend["url"], route.kind)
+        body["model"] = backend.get("model", route.name)
+        headers = route._auth_headers(backend)
+        try:
+            if stream:
+                return await _proxy_stream_inline(request, url, body, headers)
+            else:
+                return await _proxy_json_inline(url, body, headers)
+        except Exception as e:
+            await route.mark_unhealthy(backend["url"])
+            last_err = str(e)
+            continue
+
+    return web.json_response(
+        {"error": f"All backends failed for '{route.name}'. Last error: {last_err}"},
+        status=503,
+    )
+
+
+async def _proxy_json_inline(url, body, headers):
+    """Forward request; raises on failure (for failover callers)."""
+    timeout = aiohttp.ClientTimeout(total=300)
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post(url, json=body, headers=headers, timeout=timeout) as resp:
+            data = await resp.json()
+            if resp.status >= 500:
+                raise aiohttp.ClientResponseError(
+                    resp.request_info, resp.history, status=resp.status,
+                    message=data.get("error", f"HTTP {resp.status}"),
+                    headers=resp.headers,
+                )
+            return web.json_response(data, status=resp.status)
+
+
+async def _proxy_stream_inline(request, url, body, headers):
+    """Forward streaming request; raises on connection failure (enables failover)."""
+    timeout = aiohttp.ClientTimeout(total=300)
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post(url, json=body, headers=headers, timeout=timeout) as backend:
+            if backend.status >= 500:
+                text = await backend.text()
+                raise aiohttp.ClientResponseError(
+                    backend.request_info, backend.history, status=backend.status,
+                    message=text or f"HTTP {backend.status}",
+                    headers=backend.headers,
+                )
+            response = web.StreamResponse(
+                status=backend.status,
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                },
+            )
+            await response.prepare(request)
+            async for chunk in backend.content.iter_any():
+                await response.write(chunk)
+    await response.write_eof()
+    return response
+
+
+async def _proxy_json(url, body, extra_headers=None):
     """Forward request and return JSON response."""
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(url, json=body, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+            headers = extra_headers or {}
+            async with sess.post(url, json=body, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=300)) as resp:
                 data = await resp.json()
                 return web.json_response(data, status=resp.status)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=502)
 
 
-async def _proxy_stream(request, url, body):
+async def _proxy_stream(request, url, body, extra_headers=None):
     """Forward streaming request, relay SSE chunks."""
     response = web.StreamResponse(
         status=200,
@@ -164,7 +258,8 @@ async def _proxy_stream(request, url, body):
     try:
         timeout = aiohttp.ClientTimeout(total=300)
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(url, json=body, timeout=timeout) as backend:
+            headers = extra_headers or {}
+            async with sess.post(url, json=body, headers=headers, timeout=timeout) as backend:
                 async for chunk in backend.content.iter_any():
                     await response.write(chunk)
     except Exception as e:
@@ -176,8 +271,9 @@ async def _proxy_stream(request, url, body):
 
 
 async def handle_models(request):
-    """GET /v1/models — list available and loaded models."""
+    """GET /v1/models — list available and loaded models (local + routed)."""
     rm = request.app["rm"]
+    route_manager = request.app.get("routes")
     models = []
     for name in rm.available_models():
         models.append({
@@ -188,6 +284,17 @@ async def handle_models(request):
             "status": "loaded" if rm.is_running(name) else "available",
             "port": rm.get_port(name),
         })
+    if route_manager:
+        for name in route_manager.available_routes():
+            route = route_manager.get_route(name)
+            models.append({
+                "id": name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "routed",
+                "status": "routed",
+                "route_kind": route.kind if route else None,
+            })
     return web.json_response({"object": "list", "data": models})
 
 
@@ -246,9 +353,58 @@ def _resolve_stt_runtime(rm):
 
 
 async def handle_stt_proxy(request):
-    """Proxy STT client traffic to the active STT runtime."""
+    """Proxy STT client traffic to the active STT runtime or route."""
     _require_client_auth(request)
     rm = request.app["rm"]
+    route_manager = request.app.get("routes")
+
+    if route_manager:
+        stt_routes = [n for n in route_manager.available_routes()
+                      if route_manager.get_route(n).kind == "stt"]
+        if stt_routes:
+            route_name = stt_routes[0]
+            route = route_manager.get_route(route_name)
+            from llm_proxy.route_manager import _derive_endpoint_url
+            body = await request.read()
+            candidates = route.failover_candidates()
+            last_err = None
+            for backend in candidates:
+                url = _derive_endpoint_url(backend["url"], "stt")
+                headers = route._auth_headers(backend)
+                if request.content_type:
+                    headers["Content-Type"] = request.headers.get("Content-Type", request.content_type)
+                prompt = request.headers.get("X-Initial-Prompt")
+                if prompt:
+                    headers["X-Initial-Prompt"] = prompt
+                query_string = request.query_string
+                if query_string:
+                    url += "?" + query_string
+                try:
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.post(
+                            url, data=body, headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=300),
+                        ) as resp:
+                            if resp.status >= 500:
+                                text = await resp.text()
+                                raise aiohttp.ClientResponseError(
+                                    resp.request_info, resp.history, status=resp.status,
+                                    message=text or f"HTTP {resp.status}",
+                                    headers=resp.headers,
+                                )
+                            raw = await resp.read()
+                            content_type = resp.headers.get("Content-Type", "application/json")
+                            return web.Response(body=raw, status=resp.status,
+                                               content_type=content_type.split(";")[0])
+                except Exception as e:
+                    await route.mark_unhealthy(backend["url"])
+                    last_err = str(e)
+                    continue
+            return web.json_response(
+                {"error": f"All STT backends failed. Last error: {last_err}"},
+                status=503,
+            )
+
     runtime_name, err = _resolve_stt_runtime(rm)
     if err:
         return err
@@ -327,8 +483,51 @@ async def handle_tts_proxy(request):
     """
     _require_client_auth(request)
     rm = request.app["rm"]
+    route_manager = request.app.get("routes")
     body = await request.json()
     requested = body.pop("voice", None) if isinstance(body, dict) else None
+
+    if route_manager and requested:
+        route = route_manager.get_route(requested)
+        if route and route.kind == "tts":
+            from llm_proxy.route_manager import _derive_endpoint_url
+            candidates = route.failover_candidates()
+            last_err = None
+            for backend in candidates:
+                url = _derive_endpoint_url(backend["url"], "tts")
+                headers = route._auth_headers(backend)
+                try:
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.post(url, json=body, headers=headers,
+                                            timeout=aiohttp.ClientTimeout(total=300)) as backend_resp:
+                            if backend_resp.status >= 500:
+                                text = await backend_resp.text()
+                                raise aiohttp.ClientResponseError(
+                                    backend_resp.request_info,
+                                    backend_resp.history,
+                                    status=backend_resp.status,
+                                    message=text or f"HTTP {backend_resp.status}",
+                                    headers=backend_resp.headers,
+                                )
+                            response = web.StreamResponse()
+                            response.set_status(backend_resp.status)
+                            for hk, hv in backend_resp.headers.items():
+                                if hk.lower() in ("content-length", "transfer-encoding", "connection"):
+                                    continue
+                                response.headers[hk] = hv
+                            await response.prepare(request)
+                            async for chunk in backend_resp.content.iter_any():
+                                await response.write(chunk)
+                            await response.write_eof()
+                            return response
+                except Exception as e:
+                    await route.mark_unhealthy(backend["url"])
+                    last_err = str(e)
+                    continue
+            return web.json_response(
+                {"error": f"All TTS backends failed. Last error: {last_err}"},
+                status=503,
+            )
 
     runtime_name, err = _resolve_tts_runtime(rm, requested)
     if err:
@@ -724,6 +923,84 @@ async def handle_runtime_settings(request):
         return web.json_response({"error": str(e)}, status=400)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_routes_list(request):
+    """GET /v1/control/routes — list all routes with health status."""
+    _require_control_auth(request)
+    route_manager = request.app.get("routes")
+    if route_manager is None:
+        return web.json_response({"routes": []})
+    return web.json_response({"routes": route_manager.list_routes_status()})
+
+
+async def handle_routes_create(request):
+    """POST /v1/control/routes — create a new route."""
+    _require_control_auth(request)
+    route_manager = request.app.get("routes")
+    if route_manager is None:
+        return web.json_response({"error": "route manager not available"}, status=500)
+    body = await request.json()
+    try:
+        await route_manager.create_route(body)
+    except ValueError as e:
+        msg = str(e)
+        status = 409 if "already exists" in msg else 400
+        return web.json_response({"error": msg}, status=status)
+    name = body.get("name")
+    route = route_manager.get_route(name)
+    return web.json_response({"ok": True, "route": route.status() if route else None})
+
+
+async def handle_routes_delete(request):
+    """DELETE /v1/control/routes/{name} — delete a route."""
+    _require_control_auth(request)
+    route_manager = request.app.get("routes")
+    if route_manager is None:
+        return web.json_response({"error": "route manager not available"}, status=500)
+    name = request.match_info["name"]
+    try:
+        await route_manager.delete_route(name)
+    except ValueError as e:
+        msg = str(e)
+        status = 404 if "Unknown route" in msg else 400
+        return web.json_response({"error": msg}, status=status)
+    return web.json_response({"ok": True, "deleted": name})
+
+
+async def handle_routes_add_backend(request):
+    """POST /v1/control/routes/{name}/backends — add a backend to a route."""
+    _require_control_auth(request)
+    route_manager = request.app.get("routes")
+    if route_manager is None:
+        return web.json_response({"error": "route manager not available"}, status=500)
+    name = request.match_info["name"]
+    body = await request.json()
+    try:
+        await route_manager.add_backend(name, body)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    route = route_manager.get_route(name)
+    return web.json_response({"ok": True, "route": route.status() if route else None})
+
+
+async def handle_routes_remove_backend(request):
+    """DELETE /v1/control/routes/{name}/backends/{index} — remove a backend by index."""
+    _require_control_auth(request)
+    route_manager = request.app.get("routes")
+    if route_manager is None:
+        return web.json_response({"error": "route manager not available"}, status=500)
+    name = request.match_info["name"]
+    try:
+        index = int(request.match_info["index"])
+    except ValueError:
+        return web.json_response({"error": "backend index must be an integer"}, status=400)
+    try:
+        await route_manager.remove_backend(name, index)
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    route = route_manager.get_route(name)
+    return web.json_response({"ok": True, "route": route.status() if route else None, "removed_index": index})
 
 
 async def handle_panel(request):

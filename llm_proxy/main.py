@@ -11,6 +11,7 @@ from llm_proxy.auth import AuthManager
 from llm_proxy.certs import certificate_fingerprint, generate_server_cert, make_ssl_context
 from llm_proxy.config import load_config
 from llm_proxy.resource_coordinator import ResourceCoordinator
+from llm_proxy.route_manager import RouteManager
 from llm_proxy.runtime_manager import RuntimeManager
 from llm_proxy.slot_manager import SlotManager
 from llm_proxy.router import create_api_app, create_control_app
@@ -21,9 +22,10 @@ async def run(config):
     rm = RuntimeManager(config, coordinator=coordinator)
     sm = SlotManager()
     auth = AuthManager(config)
+    routes = RouteManager(config)
     coordinator.register("runtime", rm.list_running_on_gpu, rm.stop)
-    api_app = create_api_app(rm, sm, auth)
-    control_app = create_control_app(rm, sm, auth)
+    api_app = create_api_app(rm, sm, auth, route_manager=routes)
+    control_app = create_control_app(rm, sm, auth, route_manager=routes)
 
     listen = config["listen"]
     api_host = listen["host"] if isinstance(listen, dict) else "0.0.0.0"
@@ -54,6 +56,7 @@ async def run(config):
     if tls_cfg.get("enabled", False):
         print(f"  TLS fingerprint: {certificate_fingerprint(tls_cfg['cert_file'])}")
     asyncio.create_task(rm.autostart())
+    await routes.start_monitoring()
 
     stop = asyncio.Event()
     loop = asyncio.get_event_loop()
@@ -69,6 +72,7 @@ async def run(config):
             await sm.save_all(name, port)
 
     await rm.stop_all()
+    await routes.stop_monitoring()
     await api_runner.cleanup()
     await control_runner.cleanup()
 

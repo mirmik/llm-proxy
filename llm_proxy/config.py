@@ -30,6 +30,8 @@ DEFAULT_CONFIG = {
     },
     "defaults": {},
     "runtimes": {},
+    "hosts": {},
+    "routes": {},
 }
 
 
@@ -75,6 +77,9 @@ def load_config(path=None):
         for _, profile in (runtime.get("profiles") or {}).items():
             _expand_profile_paths(profile)
 
+    for name, route in (config.get("routes") or {}).items():
+        _validate_route(name, route)
+
     return config
 
 
@@ -115,6 +120,22 @@ def _deep_update(base, override):
             _deep_update(base[k], v)
         else:
             base[k] = v
+
+
+def _validate_route(name, route):
+    if not isinstance(route, dict):
+        raise ValueError(f"Route '{name}' must be a dict")
+    backends = route.get("backends", [])
+    if not isinstance(backends, list):
+        raise ValueError(f"Route '{name}' must have a 'backends' list")
+    for i, b in enumerate(backends):
+        if not isinstance(b, dict):
+            raise ValueError(f"Route '{name}'.backends[{i}] must be a dict")
+        if not b.get("url"):
+            raise ValueError(f"Route '{name}'.backends[{i}] requires 'url'")
+    kind = route.get("kind", "llm")
+    if kind not in ("llm", "stt", "tts"):
+        raise ValueError(f"Route '{name}' has unknown kind: {kind}")
 
 
 def _expand_profile_paths(profile):
