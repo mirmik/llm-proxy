@@ -11,7 +11,8 @@ from llm_proxy.config import load_config_file, save_config_file
 
 
 def _setup_app(rm, sm, auth, routes=None):
-    app = web.Application()
+    max_size = int((getattr(rm, "config", {}) or {}).get("client_max_size", 64 * 1024 * 1024))
+    app = web.Application(client_max_size=max_size)
     app["rm"] = rm
     app["sm"] = sm
     app["auth"] = auth
