@@ -104,14 +104,12 @@ def _resolve_model(rm, model_name, route_manager=None):
     )
 
 
-async def _ensure_slot(rm, sm, model_name, session_id, port):
-    """Assign a slot for the session if session_id is provided. Returns slot_id or None."""
-    if not session_id:
-        return None
+async def _acquire_slot(rm, sm, model_name, session_id, port):
+    """Acquire an exclusive slot lease for this local backend request."""
     num_slots = rm.get_slots(model_name)
     if model_name not in sm._slots:
         sm.init_model(model_name, num_slots)
-    return await sm.assign(model_name, session_id, port)
+    return await sm.acquire(model_name, session_id, port)
 
 
 async def handle_chat(request):
@@ -157,16 +155,20 @@ async def handle_chat(request):
             status=503,
         )
 
-    slot_id = await _ensure_slot(rm, sm, model_name, session_id, port)
+    slot_id = await _acquire_slot(rm, sm, model_name, session_id, port)
     if slot_id is not None:
         body["id_slot"] = slot_id
 
     backend_url = f"http://127.0.0.1:{port}/v1/chat/completions"
 
-    if stream:
-        return await _proxy_stream(request, backend_url, body)
-    else:
-        return await _proxy_json(backend_url, body)
+    try:
+        if stream:
+            return await _proxy_stream(request, backend_url, body)
+        else:
+            return await _proxy_json(backend_url, body)
+    finally:
+        if slot_id is not None:
+            await sm.release(model_name, slot_id)
 
 
 async def _proxy_routed(request, route, body, stream):

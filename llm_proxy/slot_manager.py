@@ -1,5 +1,6 @@
 """Slot Manager — assign sessions to slots, save/restore KV cache."""
 
+import asyncio
 import time
 
 import aiohttp
@@ -9,21 +10,24 @@ class SlotManager:
     """Manages slot ↔ session mapping with LRU eviction and KV cache persistence."""
 
     def __init__(self):
-        # model_name → {slot_id: {"session": str|None, "last_used": float}}
+        # model_name → {slot_id: {"session": str|None, "last_used": float, "busy": bool}}
         self._slots = {}
+        self._conditions = {}
         # Models where save/restore is known to be unsupported
         self._no_persistence = set()
 
     def init_model(self, model_name, num_slots):
         """Register slots for a newly started model."""
         self._slots[model_name] = {
-            i: {"session": None, "last_used": 0}
+            i: {"session": None, "last_used": 0, "busy": False}
             for i in range(num_slots)
         }
+        self._conditions[model_name] = asyncio.Condition()
 
     def remove_model(self, model_name):
         """Remove slot tracking for a stopped model."""
         self._slots.pop(model_name, None)
+        self._conditions.pop(model_name, None)
         self._no_persistence.discard(model_name)
 
     def get_slot(self, model_name, session_id):
@@ -34,51 +38,94 @@ class SlotManager:
                 return slot_id
         return None
 
-    async def assign(self, model_name, session_id, port):
-        """Assign a slot to a session. Returns slot_id.
+    async def acquire(self, model_name, session_id, port):
+        """Acquire an exclusive slot lease for a session. Returns slot_id.
 
-        If session is already loaded — returns its slot (cache hit).
-        If free slot available — uses it.
-        Otherwise — evicts LRU slot (saving its cache first).
+        If the session is already loaded in an idle slot, uses it.
+        If a free idle slot is available, restores the session into it.
+        Otherwise waits for an idle slot, then evicts the LRU session.
+        A None session_id acquires a transient slot without restoring or saving
+        transient state.
         """
         slots = self._slots.get(model_name)
         if not slots:
             return 0
 
-        # Already in a slot?
-        existing = self.get_slot(model_name, session_id)
-        if existing is not None:
-            slots[existing]["last_used"] = time.time()
-            return existing
+        transient = session_id is None
+        condition = self._conditions.setdefault(model_name, asyncio.Condition())
+        async with condition:
+            while True:
+                # Already in a slot?
+                if not transient:
+                    existing = self.get_slot(model_name, session_id)
+                    if existing is not None:
+                        info = slots[existing]
+                        if info["busy"]:
+                            await condition.wait()
+                            continue
+                        info["busy"] = True
+                        info["last_used"] = time.time()
+                        return existing
 
-        # Free slot?
-        for slot_id, info in slots.items():
-            if info["session"] is None:
+                # Free idle slot?
+                for slot_id, info in slots.items():
+                    if info["session"] is None and not info["busy"]:
+                        info["busy"] = True
+                        info["session"] = session_id
+                        info["last_used"] = time.time()
+                        if not transient:
+                            await self._restore(model_name, port, slot_id, session_id)
+                        return slot_id
+
+                idle_slots = [slot_id for slot_id, info in slots.items() if not info["busy"]]
+                if not idle_slots:
+                    await condition.wait()
+                    continue
+
+                # Evict LRU among idle slots only.
+                lru_slot = min(idle_slots, key=lambda s: slots[s]["last_used"])
+                info = slots[lru_slot]
+                old_session = info["session"]
+                info["busy"] = True
+
+                if old_session:
+                    await self._save(model_name, port, lru_slot, old_session)
+
+                if not transient:
+                    await self._restore(model_name, port, lru_slot, session_id)
                 info["session"] = session_id
                 info["last_used"] = time.time()
-                await self._restore(model_name, port, slot_id, session_id)
-                return slot_id
+                return lru_slot
 
-        # Evict LRU
-        lru_slot = min(slots, key=lambda s: slots[s]["last_used"])
-        old_session = slots[lru_slot]["session"]
+    async def assign(self, model_name, session_id, port):
+        """Backward-compatible alias. Callers must release the returned slot."""
+        return await self.acquire(model_name, session_id, port)
 
-        if old_session:
-            await self._save(model_name, port, lru_slot, old_session)
-
-        await self._restore(model_name, port, lru_slot, session_id)
-        slots[lru_slot]["session"] = session_id
-        slots[lru_slot]["last_used"] = time.time()
-        return lru_slot
+    async def release(self, model_name, slot_id):
+        """Release a slot lease after the backend request has fully completed."""
+        slots = self._slots.get(model_name)
+        if not slots or slot_id not in slots:
+            return
+        condition = self._conditions.setdefault(model_name, asyncio.Condition())
+        async with condition:
+            slots[slot_id]["busy"] = False
+            slots[slot_id]["last_used"] = time.time()
+            condition.notify_all()
 
     async def save_all(self, model_name, port):
         """Save all active slots for a model (before stopping)."""
         if model_name in self._no_persistence:
             return
         slots = self._slots.get(model_name, {})
-        for slot_id, info in slots.items():
-            if info["session"]:
-                await self._save(model_name, port, slot_id, info["session"])
+        if not slots:
+            return
+        condition = self._conditions.setdefault(model_name, asyncio.Condition())
+        async with condition:
+            while any(info["busy"] for info in slots.values()):
+                await condition.wait()
+            for slot_id, info in slots.items():
+                if info["session"]:
+                    await self._save(model_name, port, slot_id, info["session"])
 
     async def _save(self, model_name, port, slot_id, session_id):
         """Save slot KV cache to disk via llama-server API."""
