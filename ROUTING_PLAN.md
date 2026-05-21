@@ -2,20 +2,29 @@
 
 ## Context
 
-Currently llm-proxy's data plane resolves model names strictly against locally-managed runtimes (`RuntimeManager`), looks up the port, and proxies to `http://127.0.0.1:{port}`. There is no way to forward requests to models running on other machines. The user wants a separate routing layer — inspired by `nemor-link`'s priority-based `ServicePool` — so that a model name can resolve to a prioritized list of remote (or local) backends with health-aware failover. A new "Routing" panel in the web UI should allow managing these routes.
+llm-proxy's routing layer lets a model name resolve to a list of remote or
+local backends with health-aware failover. LLM routes are session-aware:
+requests with the same extracted session key stay sticky to the same backend
+while new sessions are placed on the least-loaded healthy backend.
 
 ## Approach
 
 **Supplement, don't replace.** The RouteManager sits alongside RuntimeManager. If a model name matches a configured route → use the route's failover logic. If no route matches → fall through to the existing RuntimeManager flow. Backward compatible: with no routes configured, nothing changes.
 
-### Routing logic (adapted from nemor-link's `pool.py` → async)
+### Routing Logic
 
 - Backends are ordered by priority (index 0 = highest).
 - Health state per URL: `None` (unknown, presumed usable), `True` (healthy), `False` (unhealthy).
-- `_best_available_locked()` returns the first URL whose health is not `False`.
-- `failover_candidates()` returns active backend first, then the rest in order — callers iterate and try each.
+- `failover_candidates(session_id=...)` returns a sticky backend first when the session is already assigned and healthy.
+- New sessions are placed by effective load: `inflight / weight`, then latency and priority.
 - Eager failure detection: a failed live request immediately marks the backend unhealthy.
+- Sticky bindings have `session_ttl` and are removed when the backend is marked unhealthy.
 - Background health monitor: one asyncio task per route, probes each backend at `check_interval`.
+
+For qwen-code, the session key extractor understands DashScope metadata:
+`metadata.promptId` shaped as `<session>#<subagent>#<turn>` becomes
+`<session>#<subagent>`. That means parallel subagents can spread across
+machines, while each subagent remains sticky after placement.
 
 ### Config (in `config.yaml`, new top-level keys)
 
@@ -30,10 +39,12 @@ routes:
     kind: llm
     health_path: "/health"
     check_interval: 5.0
+    session_ttl: 3600
     backends:
       - url: "http://192.168.1.100:8080"
         model: "qwen3.5-122b"       # overrides model in proxied request
         auth: "remote-cluster"
+        weight: 2                   # receives roughly 2x load
       - url: "http://192.168.1.101:8080"   # no auth = unauthenticated
 ```
 
@@ -60,7 +71,7 @@ routes:
 POST /v1/chat/completions {model: "qwen3.5-122b"}
   → _resolve_model() checks RuntimeManager → no match
   → checks RouteManager → match found
-  → route.failover_candidates() → [{url: "http://192.168.1.100:8080", ...}, ...]
+  → route.failover_candidates(session_id=...) → [{url: "http://192.168.1.100:8080", ...}, ...]
   → for each backend:
       POST to {url}/v1/chat/completions with auth headers
       success → return response

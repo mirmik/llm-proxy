@@ -366,7 +366,7 @@ async def _proxy_routed(
     """Forward request through a Route's failover chain."""
     from llm_proxy.route_manager import _derive_endpoint_url
 
-    candidates = route.failover_candidates()
+    candidates = route.failover_candidates(session_id=session_id)
     last_err = None
     for backend in candidates:
         url = _derive_endpoint_url(backend["url"], route.kind)
@@ -374,6 +374,7 @@ async def _proxy_routed(
         headers = route._auth_headers(backend)
         _add_session_header(headers, session_id)
         host = _client_host(request)
+        route.note_request_start(session_id, backend["url"])
         log_event(
             "request forward",
             kind=route.kind,
@@ -381,26 +382,30 @@ async def _proxy_routed(
             model=body["model"],
             route=route.name,
             backend=_backend_label(url),
+            route_reason=backend.get("_route_reason"),
+            route_inflight=backend.get("_inflight"),
             session=_session_label(session_id),
             session_source=session_source,
             stream=stream,
         )
         try:
             if stream:
-                return await _proxy_stream_inline(
+                response = await _proxy_stream_inline(
                     request,
                     url,
                     body,
                     headers,
                     op={"kind": route.kind, "host": host, "model": body["model"], "started": request_started or now()},
                 )
+                return response
             else:
-                return await _proxy_json_inline(
+                response = await _proxy_json_inline(
                     url,
                     body,
                     headers,
                     op={"kind": route.kind, "host": host, "model": body["model"], "started": request_started or now()},
                 )
+                return response
         except Exception as e:
             await route.mark_unhealthy(backend["url"])
             log_event(
@@ -414,6 +419,8 @@ async def _proxy_routed(
             )
             last_err = str(e)
             continue
+        finally:
+            route.note_request_end(session_id, backend["url"])
 
     log_event("request failed", kind=route.kind, route=route.name, ms=elapsed_ms(request_started or now()))
     return web.json_response(

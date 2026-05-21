@@ -1,4 +1,4 @@
-"""Route manager — priority-based routing with health-aware failover.
+"""Route manager — session-aware routing with health-aware failover.
 
 Adapted from nemor-link's ServicePool (pool.py), made async with aiohttp.
 """
@@ -44,18 +44,23 @@ class Route:
     """One named route with a priority-ordered list of backends and health state."""
 
     def __init__(self, name, backends, kind="llm", health_path="/health",
-                 health_timeout=2.0, check_interval=5.0, hosts=None):
+                 health_timeout=2.0, check_interval=5.0, hosts=None,
+                 session_ttl=3600.0):
         self.name = name
         self.kind = kind
         self.backends = list(backends)
         self.health_path = health_path
         self.health_timeout = health_timeout
         self.check_interval = check_interval
+        self.session_ttl = float(session_ttl)
         self.hosts = hosts or {}
         self._by_url = {}
         self._healthy = {}
         self._latency = {}
         self._last_checked = {}
+        self._inflight = {}
+        self._session_backend = {}
+        self._session_seen = {}
         self._active_url = backends[0]["url"] if backends else None
         self._lock = asyncio.Lock()
 
@@ -65,6 +70,7 @@ class Route:
             self._healthy[u] = None
             self._latency[u] = None
             self._last_checked[u] = None
+            self._inflight[u] = 0
 
     def _resolve_auth(self, backend):
         auth_name = backend.get("auth")
@@ -112,6 +118,7 @@ class Route:
         async with self._lock:
             self._healthy[url] = False
             self._active_url = self._best_available_locked()
+            self._drop_sessions_for_url_locked(url)
 
     async def probe(self, url):
         health_url = _derive_health_url(url, self.health_path)
@@ -137,23 +144,80 @@ class Route:
             results.append((b["url"], ok, lat))
         return results
 
-    def failover_candidates(self):
-        """Return backends ordered: active first, then the rest in priority order."""
-        active_url = self._active_url
+    def failover_candidates(self, session_id=None):
+        """Return backends ordered by sticky session, health, and current load."""
+        self._prune_sessions()
+        sticky_url = self._session_backend.get(session_id) if session_id else None
+        if sticky_url and self._healthy.get(sticky_url) is not False and sticky_url in self._by_url:
+            ordered_urls = [sticky_url]
+            reason = "sticky"
+        else:
+            ordered_urls = []
+            reason = "least-loaded" if session_id else "least-loaded-no-session"
+
+        remaining = [
+            b["url"] for b in self.backends
+            if b["url"] not in ordered_urls
+        ]
+        remaining.sort(key=self._candidate_score)
+        ordered_urls.extend(remaining)
+
         out = []
-        if active_url and active_url in self._by_url:
-            b = self._by_url[active_url]
-            out.append(self._enriched_backend(b))
-        for b in self.backends:
-            if b["url"] != active_url:
-                out.append(self._enriched_backend(b))
+        for index, url in enumerate(ordered_urls):
+            backend = self._enriched_backend(self._by_url[url])
+            backend["_route_reason"] = reason if index == 0 else "failover"
+            backend["_sticky_session"] = bool(session_id and self._session_backend.get(session_id) == url)
+            out.append(backend)
         return out
+
+    def note_request_start(self, session_id, url):
+        self._inflight[url] = self._inflight.get(url, 0) + 1
+        if session_id:
+            self._session_backend[session_id] = url
+            self._session_seen[session_id] = time.time()
+
+    def note_request_end(self, session_id, url):
+        self._inflight[url] = max(0, self._inflight.get(url, 0) - 1)
+        if session_id and self._session_backend.get(session_id) == url:
+            self._session_seen[session_id] = time.time()
+
+    def _candidate_score(self, url):
+        healthy_penalty = 0 if self._healthy.get(url) is not False else 1
+        backend = self._by_url.get(url) or {}
+        weight = max(float(backend.get("weight", 1) or 1), 0.001)
+        load = self._inflight.get(url, 0) / weight
+        latency = self._latency.get(url)
+        latency_score = latency if latency is not None else 0.0
+        priority = self._backend_index(url)
+        return (healthy_penalty, load, latency_score, priority)
+
+    def _backend_index(self, url):
+        for index, backend in enumerate(self.backends):
+            if backend["url"] == url:
+                return index
+        return len(self.backends)
+
+    def _prune_sessions(self):
+        if not self._session_seen or self.session_ttl <= 0:
+            return
+        cutoff = time.time() - self.session_ttl
+        expired = [sid for sid, seen in self._session_seen.items() if seen < cutoff]
+        for sid in expired:
+            self._session_seen.pop(sid, None)
+            self._session_backend.pop(sid, None)
+
+    def _drop_sessions_for_url_locked(self, url):
+        stale = [sid for sid, bound in self._session_backend.items() if bound == url]
+        for sid in stale:
+            self._session_backend.pop(sid, None)
+            self._session_seen.pop(sid, None)
 
     def _enriched_backend(self, backend):
         d = dict(backend)
         d["_host"] = self._resolve_auth(backend)
         d["_healthy"] = self._healthy.get(backend["url"])
         d["_latency"] = self._latency.get(backend["url"])
+        d["_inflight"] = self._inflight.get(backend["url"], 0)
         return d
 
     def active(self):
@@ -175,6 +239,8 @@ class Route:
                 "healthy": self._healthy.get(u),
                 "latency_ms": round(self._latency[u] * 1000, 1) if self._latency.get(u) else None,
                 "last_checked": self._last_checked.get(u),
+                "inflight": self._inflight.get(u, 0),
+                "weight": b.get("weight", 1),
             })
         return {
             "name": self.name,
@@ -182,6 +248,8 @@ class Route:
             "active_url": self._active_url,
             "health_path": self.health_path,
             "check_interval": self.check_interval,
+            "session_ttl": self.session_ttl,
+            "sticky_sessions": len(self._session_backend),
             "backends": backends_status,
         }
 
@@ -192,6 +260,7 @@ class Route:
         self._healthy[u] = None
         self._latency[u] = None
         self._last_checked[u] = None
+        self._inflight[u] = 0
         if self._active_url is None:
             self._active_url = u
 
@@ -202,6 +271,8 @@ class Route:
         self._healthy.pop(u, None)
         self._latency.pop(u, None)
         self._last_checked.pop(u, None)
+        self._inflight.pop(u, None)
+        self._drop_sessions_for_url_locked(u)
         if self._active_url == u:
             self._active_url = self._best_available_locked()
 
@@ -211,6 +282,7 @@ class Route:
             "health_path": self.health_path,
             "health_timeout": self.health_timeout,
             "check_interval": self.check_interval,
+            "session_ttl": self.session_ttl,
             "backends": [
                 {k: v for k, v in b.items() if not k.startswith("_")}
                 for b in self.backends
@@ -241,6 +313,7 @@ class RouteManager:
                 health_path=spec.get("health_path", KIND_HEALTH_DEFAULTS.get(spec.get("kind", "llm"), "/health")),
                 health_timeout=spec.get("health_timeout", 2.0),
                 check_interval=spec.get("check_interval", 5.0),
+                session_ttl=spec.get("session_ttl", 3600.0),
                 hosts=hosts,
             )
             self._routes[name] = route
@@ -424,6 +497,8 @@ def _upsert_route(data, name, spec):
         entry["health_timeout"] = spec["health_timeout"]
     if "check_interval" in spec:
         entry["check_interval"] = spec["check_interval"]
+    if "session_ttl" in spec:
+        entry["session_ttl"] = spec["session_ttl"]
     routes[name] = entry
 
 
