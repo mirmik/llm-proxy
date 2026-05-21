@@ -528,15 +528,25 @@ async def _proxy_stream(request, url, body, extra_headers=None, op=None):
                 status = backend.status
                 async for chunk in backend.content.iter_any():
                     await response.write(chunk)
+    except (aiohttp.ClientConnectionResetError, ConnectionResetError, BrokenPipeError) as e:
+        _log_proxy_done(op, 499, error="client-disconnect")
+        return response
     except Exception as e:
         status = 502
         error_chunk = f"data: {json.dumps({'error': str(e)})}\n\n"
-        await response.write(error_chunk.encode())
+        try:
+            await response.write(error_chunk.encode())
+        except (aiohttp.ClientConnectionResetError, ConnectionResetError, BrokenPipeError):
+            _log_proxy_done(op, 499, error="client-disconnect")
+            return response
         _log_proxy_done(op, status, error=e)
     else:
         _log_proxy_done(op, status)
 
-    await response.write_eof()
+    try:
+        await response.write_eof()
+    except (aiohttp.ClientConnectionResetError, ConnectionResetError, BrokenPipeError):
+        pass
     return response
 
 

@@ -75,7 +75,7 @@ class SlotManagerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         )
         await sm.release("model", second_slot)
 
-    async def test_transient_request_waits_instead_of_evicting_persistent_session(self):
+    async def test_transient_request_can_evict_persistent_session_without_restoring(self):
         sm = RecordingSlotManager()
         sm.init_model("model", 1)
 
@@ -84,18 +84,15 @@ class SlotManagerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         sm.saved.clear()
         sm.restored.clear()
 
-        transient = asyncio.create_task(sm.acquire("model", None, 8081))
-        await asyncio.sleep(0)
+        transient_slot = await sm.acquire("model", None, 8081)
 
-        self.assertFalse(transient.done())
-        self.assertEqual(sm.saved, [])
+        self.assertEqual(transient_slot, 0)
+        self.assertEqual(sm.saved, [("model", 8081, 0, "session-a")])
         self.assertEqual(sm.restored, [])
-        self.assertEqual(sm._slots["model"][0]["session"], "session-a")
-        transient.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await transient
+        self.assertIsNone(sm._slots["model"][0]["session"])
+        await sm.release("model", transient_slot)
 
-    async def test_transient_request_reuses_transient_slot_without_evicting_persistent_session(self):
+    async def test_transient_request_reuses_busy_transient_slot_without_evicting_persistent_session(self):
         sm = RecordingSlotManager()
         sm.init_model("model", 2)
 
@@ -119,6 +116,26 @@ class SlotManagerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sm.saved, [])
         self.assertEqual(sm.restored, [])
         self.assertEqual(sm._slots["model"][session_slot]["session"], "session-a")
+        await sm.release("model", second_transient_slot)
+
+    async def test_transient_requests_share_one_slot_even_when_another_slot_is_empty(self):
+        sm = RecordingSlotManager()
+        sm.init_model("model", 2)
+
+        first_transient_slot = await sm.acquire("model", None, 8081)
+
+        second_transient = asyncio.create_task(sm.acquire("model", None, 8081))
+        await asyncio.sleep(0)
+
+        self.assertFalse(second_transient.done())
+        self.assertIsNone(sm._slots["model"][1]["session"])
+
+        await sm.release("model", first_transient_slot)
+        second_transient_slot = await asyncio.wait_for(second_transient, timeout=1)
+
+        self.assertEqual(second_transient_slot, first_transient_slot)
+        self.assertEqual(sm.saved, [])
+        self.assertEqual(sm.restored, [])
         await sm.release("model", second_transient_slot)
 
     async def test_cache_filename_is_safe_for_path_like_session_ids(self):
