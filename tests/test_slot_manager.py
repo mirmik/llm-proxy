@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 
-from llm_proxy.slot_manager import SlotManager
+from llm_proxy.slot_manager import SlotManager, _cache_filename
 
 
 class RecordingSlotManager(SlotManager):
@@ -91,6 +91,13 @@ class SlotManagerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sm.restored, [])
         self.assertIsNone(sm._slots["model"][0]["session"])
         await sm.release("model", transient_slot)
+
+    async def test_cache_filename_is_safe_for_path_like_session_ids(self):
+        filename = _cache_filename("atom/2026/05/21/session:1529")
+
+        self.assertNotIn("/", filename)
+        self.assertNotIn("\\", filename)
+        self.assertIn("-", filename)
 
 
 if __name__ == "__main__":

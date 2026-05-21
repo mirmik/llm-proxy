@@ -1,6 +1,8 @@
 """Slot Manager — assign sessions to slots, save/restore KV cache."""
 
 import asyncio
+import hashlib
+import re
 import time
 
 import aiohttp
@@ -181,7 +183,8 @@ class SlotManager:
             return
         started = now()
         url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=save"
-        body = {"filename": session_id}
+        filename = _cache_filename(session_id)
+        body = {"filename": filename}
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -193,16 +196,22 @@ class SlotManager:
                             slot=slot_id,
                             status=resp.status,
                             ms=elapsed_ms(started),
+                            file=filename,
                         )
                     elif resp.status == 400:
-                        self._no_persistence.add(model_name)
+                        text = await resp.text()
+                        unsupported = _looks_persistence_unsupported(text)
+                        if unsupported:
+                            self._no_persistence.add(model_name)
                         log_event(
-                            "slot save disabled",
+                            "slot save disabled" if unsupported else "slot save failed",
                             model=model_name,
                             session=_session_label(session_id),
                             slot=slot_id,
                             status=resp.status,
                             ms=elapsed_ms(started),
+                            file=filename,
+                            error=_short_error(text),
                         )
                     else:
                         text = await resp.text()
@@ -213,6 +222,7 @@ class SlotManager:
                             slot=slot_id,
                             status=resp.status,
                             ms=elapsed_ms(started),
+                            file=filename,
                             error=_short_error(text),
                         )
         except Exception as e:
@@ -222,6 +232,7 @@ class SlotManager:
                 session=_session_label(session_id),
                 slot=slot_id,
                 ms=elapsed_ms(started),
+                file=filename,
                 error=e,
             )
 
@@ -231,7 +242,8 @@ class SlotManager:
             return
         started = now()
         url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=restore"
-        body = {"filename": session_id}
+        filename = _cache_filename(session_id)
+        body = {"filename": filename}
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -243,8 +255,10 @@ class SlotManager:
                             slot=slot_id,
                             status=resp.status,
                             ms=elapsed_ms(started),
+                            file=filename,
                         )
                     elif resp.status == 400:
+                        text = await resp.text()
                         log_event(
                             "slot restore skipped",
                             model=model_name,
@@ -252,7 +266,9 @@ class SlotManager:
                             slot=slot_id,
                             status=resp.status,
                             ms=elapsed_ms(started),
+                            file=filename,
                             reason="missing-or-unsupported",
+                            error=_short_error(text),
                         )
                     else:
                         text = await resp.text()
@@ -263,6 +279,7 @@ class SlotManager:
                             slot=slot_id,
                             status=resp.status,
                             ms=elapsed_ms(started),
+                            file=filename,
                             error=_short_error(text),
                         )
         except Exception as e:
@@ -272,6 +289,7 @@ class SlotManager:
                 session=_session_label(session_id),
                 slot=slot_id,
                 ms=elapsed_ms(started),
+                file=filename,
                 error=e,
             )
 
@@ -290,3 +308,22 @@ def _short_error(text, limit=120):
     if len(text) <= limit:
         return text
     return text[:limit] + "..."
+
+
+def _cache_filename(session_id):
+    text = str(session_id)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._-")
+    if not prefix:
+        prefix = "session"
+    return f"{prefix[:48]}-{digest}"
+
+
+def _looks_persistence_unsupported(text):
+    lowered = str(text).lower()
+    return (
+        "not supported" in lowered
+        or "unsupported" in lowered
+        or "slot_save_path" in lowered
+        or "slot save path" in lowered
+    )
