@@ -1,9 +1,17 @@
 import unittest
 
-from llm_proxy.route_manager import Route
+from llm_proxy.route_manager import Route, backend_client_kwargs
 
 
 class RouteSessionDispatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tls_verify_false_disables_aiohttp_ssl_verification(self):
+        kwargs = backend_client_kwargs({"url": "https://host:8090", "tls_verify": False})
+        connector = kwargs.get("connector")
+
+        self.assertIsNotNone(connector)
+        self.assertFalse(connector._ssl)
+        await connector.close()
+
     def test_new_sessions_use_least_loaded_backend(self):
         route = Route(
             "model",

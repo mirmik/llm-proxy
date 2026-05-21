@@ -394,7 +394,8 @@
         </div>
         <div class="field"><label>Health path</label><input id="nrt-health-path" value="/health"></div>
         <div class="field"><label>Health timeout (s)</label><input id="nrt-health-timeout" value="2.0"></div>
-        <div class="field" style="grid-column:1/-1;"><label>Check interval (s)</label><input id="nrt-check-interval" value="5.0"></div>
+        <div class="field"><label>Check interval (s)</label><input id="nrt-check-interval" value="5.0"></div>
+        <div class="field"><label>Session TTL (s)</label><input id="nrt-session-ttl" value="14400"></div>
       </div>
       <div class="actions">
         <button class="btn" id="newRouteCreate">Create route</button>
@@ -864,12 +865,18 @@
     backends.forEach((b, i) => {
       rows += `<tr>
         <td>${i}</td>
-        <td class="mono">${escapeHtml(b.url)}</td>
-        <td>${escapeHtml(b.model || route.name)}</td>
-        <td>${escapeHtml(b.auth || "—")}</td>
+        <td><input class="rb-url mono" value="${escapeHtml(b.url)}"></td>
+        <td><input class="rb-model" value="${escapeHtml(b.model || route.name)}"></td>
+        <td><input class="rb-auth" value="${escapeHtml(b.auth || "")}" placeholder="—"></td>
+        <td><input class="rb-weight" value="${escapeHtml(String(b.weight || 1))}"></td>
+        <td style="text-align:center;"><input type="checkbox" class="rb-tls-verify" ${b.tls_verify === false ? "" : "checked"}></td>
         <td>${healthDot(b.healthy)}</td>
         <td>${b.latency_ms != null ? b.latency_ms + " ms" : "—"}</td>
-        <td class="actions-cell"><button class="danger" data-route-action="rm-backend" data-route="${escapeHtml(route.name)}" data-index="${i}">Remove</button></td>
+        <td>${escapeHtml(String(b.inflight || 0))}</td>
+        <td class="actions-cell">
+          <button class="secondary" data-route-action="save-backend" data-route="${escapeHtml(route.name)}" data-index="${i}">Save</button>
+          <button class="danger" data-route-action="rm-backend" data-route="${escapeHtml(route.name)}" data-index="${i}">Remove</button>
+        </td>
       </tr>`;
     });
 
@@ -882,17 +889,28 @@
         </div>
       </div>
       <div style="margin-bottom:8px;font-size:0.82rem;color:var(--text-muted);">
-        Active: <code>${escapeHtml(route.active_url || "—")}</code> · Health path: <code>${escapeHtml(route.health_path)}</code> · Check interval: ${escapeHtml(String(route.check_interval))}s
+        Active: <code>${escapeHtml(route.active_url || "—")}</code> · Sticky sessions: ${escapeHtml(String(route.sticky_sessions || 0))}
+      </div>
+      <div class="route-settings" data-route="${escapeHtml(route.name)}" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:12px;">
+        <div class="field"><label>Health path</label><input class="rs-health-path" value="${escapeHtml(route.health_path || "/health")}"></div>
+        <div class="field"><label>Health timeout (s)</label><input class="rs-health-timeout" value="${escapeHtml(String(route.health_timeout || 2.0))}"></div>
+        <div class="field"><label>Check interval (s)</label><input class="rs-check-interval" value="${escapeHtml(String(route.check_interval || 5.0))}"></div>
+        <div class="field"><label>Session TTL (s)</label><input class="rs-session-ttl" value="${escapeHtml(String(route.session_ttl || 3600))}"></div>
+        <div class="actions" style="grid-column:1/-1;margin:0;">
+          <button class="secondary" data-route-action="save-route-settings" data-route="${escapeHtml(route.name)}">Save route settings</button>
+        </div>
       </div>
       <table>
-        <thead><tr><th>#</th><th>URL</th><th>Model</th><th>Auth</th><th>OK?</th><th>Latency</th><th></th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="7" class="empty">No backends configured.</td></tr>'}</tbody>
+        <thead><tr><th>#</th><th>URL</th><th>Model</th><th>Auth</th><th>Weight</th><th>TLS verify</th><th>OK?</th><th>Latency</th><th>Inflight</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="10" class="empty">No backends configured.</td></tr>'}</tbody>
       </table>
       <div class="add-backend-form" data-route="${escapeHtml(route.name)}" hidden style="margin-top:12px;padding:12px;border:1px solid var(--border-soft);border-radius:8px;">
         <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;">
           <div class="field" style="grid-column:1/-1;"><label>URL *</label><input class="ab-url" placeholder="http://192.168.1.100:8080"></div>
           <div class="field"><label>Model override</label><input class="ab-model" placeholder="${escapeHtml(route.name)}"></div>
           <div class="field"><label>Auth host name</label><input class="ab-auth" placeholder="remote-cluster"></div>
+          <div class="field"><label>Weight</label><input class="ab-weight" value="1"></div>
+          <div class="field"><label>TLS verify</label><select class="ab-tls-verify"><option value="true">true</option><option value="false">false</option></select></div>
         </div>
         <div class="actions">
           <button class="btn" data-route-action="add-backend-save" data-route="${escapeHtml(route.name)}">Add</button>
@@ -929,6 +947,40 @@
       return;
     }
 
+    if (action === "save-route-settings") {
+      const form = document.querySelector(`.route-settings[data-route="${CSS.escape(routeName)}"]`);
+      if (!form) return;
+      const body = {
+        health_path: form.querySelector(".rs-health-path").value.trim() || "/health",
+        health_timeout: parseFloat(form.querySelector(".rs-health-timeout").value) || 2.0,
+        check_interval: parseFloat(form.querySelector(".rs-check-interval").value) || 5.0,
+        session_ttl: parseFloat(form.querySelector(".rs-session-ttl").value) || 3600,
+      };
+      try {
+        await api(`/v1/control/routes/${encodeURIComponent(routeName)}/settings`, {method: "POST", body: JSON.stringify(body)});
+        await refreshRoutes();
+      } catch (err) { setMsg(routeMsg, "Save failed: " + err.message, "error"); }
+      return;
+    }
+
+    if (action === "save-backend") {
+      const row = t.closest("tr");
+      const idx = t.dataset.index;
+      if (!row) return;
+      const body = {
+        url: row.querySelector(".rb-url").value.trim(),
+        model: row.querySelector(".rb-model").value.trim(),
+        auth: row.querySelector(".rb-auth").value.trim(),
+        weight: parseFloat(row.querySelector(".rb-weight").value) || 1,
+        tls_verify: row.querySelector(".rb-tls-verify").checked,
+      };
+      try {
+        await api(`/v1/control/routes/${encodeURIComponent(routeName)}/backends/${idx}/settings`, {method: "POST", body: JSON.stringify(body)});
+        await refreshRoutes();
+      } catch (err) { setMsg(routeMsg, "Save failed: " + err.message, "error"); }
+      return;
+    }
+
     if (action === "add-backend-form") {
       const form = document.querySelector(`.add-backend-form[data-route="${CSS.escape(routeName)}"]`);
       if (form) form.hidden = !form.hidden;
@@ -947,8 +999,10 @@
       const url = form.querySelector(".ab-url").value.trim();
       const model = form.querySelector(".ab-model").value.trim();
       const auth = form.querySelector(".ab-auth").value.trim();
+      const weight = parseFloat(form.querySelector(".ab-weight").value) || 1;
+      const tlsVerify = form.querySelector(".ab-tls-verify").value !== "false";
       if (!url) { setMsg(document.getElementById(`routeMsg-${routeName}`), "URL is required.", "error"); return; }
-      const body = {url};
+      const body = {url, weight, tls_verify: tlsVerify};
       if (model) body.model = model;
       if (auth) body.auth = auth;
       try {
@@ -980,6 +1034,7 @@
       health_path: document.getElementById("nrt-health-path").value || "/health",
       health_timeout: parseFloat(document.getElementById("nrt-health-timeout").value) || 2.0,
       check_interval: parseFloat(document.getElementById("nrt-check-interval").value) || 5.0,
+      session_ttl: parseFloat(document.getElementById("nrt-session-ttl").value) || 14400,
       backends: [],
     };
     try {

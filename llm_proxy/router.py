@@ -218,7 +218,9 @@ def create_control_app(runtime_manager, slot_manager, auth_manager=None, route_m
     app.router.add_get("/v1/control/routes", handle_routes_list)
     app.router.add_post("/v1/control/routes", handle_routes_create)
     app.router.add_delete("/v1/control/routes/{name}", handle_routes_delete)
+    app.router.add_post("/v1/control/routes/{name}/settings", handle_routes_settings)
     app.router.add_post("/v1/control/routes/{name}/backends", handle_routes_add_backend)
+    app.router.add_post("/v1/control/routes/{name}/backends/{index}/settings", handle_routes_update_backend)
     app.router.add_delete("/v1/control/routes/{name}/backends/{index}", handle_routes_remove_backend)
     app.router.add_get("/v1/control/tls", handle_tls_status)
     app.router.add_post("/v1/control/tls", handle_tls_toggle)
@@ -416,6 +418,7 @@ async def _proxy_routed(
                     url,
                     body,
                     headers,
+                    backend=backend,
                     op={"kind": route.kind, "host": host, "model": body["model"], "started": request_started or now()},
                 )
                 return response
@@ -424,6 +427,7 @@ async def _proxy_routed(
                     url,
                     body,
                     headers,
+                    backend=backend,
                     op={"kind": route.kind, "host": host, "model": body["model"], "started": request_started or now()},
                 )
                 return response
@@ -450,10 +454,12 @@ async def _proxy_routed(
     )
 
 
-async def _proxy_json_inline(url, body, headers, op=None):
+async def _proxy_json_inline(url, body, headers, backend=None, op=None):
     """Forward request; raises on failure (for failover callers)."""
+    from llm_proxy.route_manager import backend_client_kwargs
+
     timeout = aiohttp.ClientTimeout(total=300)
-    async with aiohttp.ClientSession() as sess:
+    async with aiohttp.ClientSession(**backend_client_kwargs(backend or {})) as sess:
         async with sess.post(url, json=body, headers=headers, timeout=timeout) as resp:
             data = await resp.json()
             if resp.status >= 500:
@@ -466,19 +472,21 @@ async def _proxy_json_inline(url, body, headers, op=None):
             return web.json_response(data, status=resp.status)
 
 
-async def _proxy_stream_inline(request, url, body, headers, op=None):
+async def _proxy_stream_inline(request, url, body, headers, backend=None, op=None):
     """Forward streaming request; raises on connection failure (enables failover)."""
+    from llm_proxy.route_manager import backend_client_kwargs
+
     timeout = aiohttp.ClientTimeout(total=300)
-    async with aiohttp.ClientSession() as sess:
-        async with sess.post(url, json=body, headers=headers, timeout=timeout) as backend:
-            if backend.status >= 500:
-                text = await backend.text()
+    async with aiohttp.ClientSession(**backend_client_kwargs(backend or {})) as sess:
+        async with sess.post(url, json=body, headers=headers, timeout=timeout) as backend_resp:
+            if backend_resp.status >= 500:
+                text = await backend_resp.text()
                 raise aiohttp.ClientResponseError(
-                    backend.request_info, backend.history, status=backend.status,
-                    message=text or f"HTTP {backend.status}",
-                    headers=backend.headers,
+                    backend_resp.request_info, backend_resp.history, status=backend_resp.status,
+                    message=text or f"HTTP {backend_resp.status}",
+                    headers=backend_resp.headers,
                 )
-            status = backend.status
+            status = backend_resp.status
             response = web.StreamResponse(
                 status=status,
                 headers={
@@ -487,7 +495,7 @@ async def _proxy_stream_inline(request, url, body, headers, op=None):
                 },
             )
             await response.prepare(request)
-            async for chunk in backend.content.iter_any():
+            async for chunk in backend_resp.content.iter_any():
                 await response.write(chunk)
     await response.write_eof()
     _log_proxy_done(op, status)
@@ -1325,6 +1333,24 @@ async def handle_routes_delete(request):
     return web.json_response({"ok": True, "deleted": name})
 
 
+async def handle_routes_settings(request):
+    """POST /v1/control/routes/{name}/settings — update editable route settings."""
+    _require_control_auth(request)
+    route_manager = request.app.get("routes")
+    if route_manager is None:
+        return web.json_response({"error": "route manager not available"}, status=500)
+    name = request.match_info["name"]
+    body = await request.json()
+    try:
+        await route_manager.update_settings(name, body)
+    except ValueError as e:
+        msg = str(e)
+        status = 404 if "Unknown route" in msg else 400
+        return web.json_response({"error": msg}, status=status)
+    route = route_manager.get_route(name)
+    return web.json_response({"ok": True, "route": route.status() if route else None})
+
+
 async def handle_routes_add_backend(request):
     """POST /v1/control/routes/{name}/backends — add a backend to a route."""
     _require_control_auth(request)
@@ -1337,6 +1363,28 @@ async def handle_routes_add_backend(request):
         await route_manager.add_backend(name, body)
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
+    route = route_manager.get_route(name)
+    return web.json_response({"ok": True, "route": route.status() if route else None})
+
+
+async def handle_routes_update_backend(request):
+    """POST /v1/control/routes/{name}/backends/{index}/settings — update a backend."""
+    _require_control_auth(request)
+    route_manager = request.app.get("routes")
+    if route_manager is None:
+        return web.json_response({"error": "route manager not available"}, status=500)
+    name = request.match_info["name"]
+    try:
+        index = int(request.match_info["index"])
+    except ValueError:
+        return web.json_response({"error": "backend index must be an integer"}, status=400)
+    body = await request.json()
+    try:
+        await route_manager.update_backend(name, index, body)
+    except ValueError as e:
+        msg = str(e)
+        status = 404 if "Unknown route" in msg else 400
+        return web.json_response({"error": msg}, status=status)
     route = route_manager.get_route(name)
     return web.json_response({"ok": True, "route": route.status() if route else None})
 

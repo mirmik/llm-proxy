@@ -40,6 +40,14 @@ def _derive_endpoint_url(base_url, kind):
     return base_url + "/" + suffix
 
 
+def backend_client_kwargs(backend):
+    """Build aiohttp ClientSession kwargs for a routed backend."""
+    verify_tls = backend.get("tls_verify", backend.get("verify_tls", True))
+    if verify_tls is False:
+        return {"connector": aiohttp.TCPConnector(ssl=False)}
+    return {}
+
+
 class Route:
     """One named route with a priority-ordered list of backends and health state."""
 
@@ -122,9 +130,10 @@ class Route:
 
     async def probe(self, url):
         health_url = _derive_health_url(url, self.health_path)
+        backend = self._by_url.get(url) or {}
         t0 = time.time()
         try:
-            async with aiohttp.ClientSession() as sess:
+            async with aiohttp.ClientSession(**backend_client_kwargs(backend)) as sess:
                 async with sess.get(
                     health_url,
                     timeout=aiohttp.ClientTimeout(total=self.health_timeout),
@@ -236,6 +245,7 @@ class Route:
                 "url": u,
                 "model": b.get("model", self.name),
                 "auth": b.get("auth"),
+                "tls_verify": b.get("tls_verify", b.get("verify_tls", True)),
                 "healthy": self._healthy.get(u),
                 "latency_ms": round(self._latency[u] * 1000, 1) if self._latency.get(u) else None,
                 "last_checked": self._last_checked.get(u),
@@ -247,6 +257,7 @@ class Route:
             "kind": self.kind,
             "active_url": self._active_url,
             "health_path": self.health_path,
+            "health_timeout": self.health_timeout,
             "check_interval": self.check_interval,
             "session_ttl": self.session_ttl,
             "sticky_sessions": len(self._session_backend),
@@ -472,6 +483,31 @@ class RouteManager:
         )
         await self._restart_monitoring_if_running()
 
+    async def update_settings(self, route_name, settings):
+        if not isinstance(settings, dict):
+            raise ValueError("settings must be an object")
+        if route_name not in self._routes:
+            raise ValueError(f"Unknown route: {route_name}")
+
+        await self._save_and_reload(
+            lambda data: _update_route_settings(data, route_name, settings)
+        )
+        await self._restart_monitoring_if_running()
+
+    async def update_backend(self, route_name, index, backend_spec):
+        if not isinstance(backend_spec, dict):
+            raise ValueError("backend must be an object")
+        route = self._routes.get(route_name)
+        if not route:
+            raise ValueError(f"Unknown route: {route_name}")
+        if index < 0 or index >= len(route.backends):
+            raise ValueError(f"Invalid backend index: {index}")
+
+        await self._save_and_reload(
+            lambda data: _update_backend(data, route_name, index, backend_spec)
+        )
+        await self._restart_monitoring_if_running()
+
     async def remove_backend(self, route_name, index):
         route = self._routes.get(route_name)
         if not route:
@@ -526,3 +562,48 @@ def _remove_backend(data, route_name, index):
     if index < 0 or index >= len(backends):
         raise ValueError(f"Invalid backend index: {index}")
     backends.pop(index)
+
+
+def _update_route_settings(data, route_name, settings):
+    routes = data.get("routes") or {}
+    route = routes.get(route_name)
+    if not route:
+        raise ValueError(f"Unknown route: {route_name}")
+
+    for key in ("health_path", "health_timeout", "check_interval", "session_ttl"):
+        if key not in settings:
+            continue
+        value = settings[key]
+        if value in ("", None):
+            continue
+        if key == "health_path":
+            route[key] = str(value)
+        else:
+            route[key] = float(value)
+
+
+def _update_backend(data, route_name, index, backend_spec):
+    routes = data.get("routes") or {}
+    route = routes.get(route_name)
+    if not route:
+        raise ValueError(f"Unknown route: {route_name}")
+    backends = route.get("backends") or []
+    if index < 0 or index >= len(backends):
+        raise ValueError(f"Invalid backend index: {index}")
+
+    current = dict(backends[index])
+    for key in ("url", "model", "auth", "weight", "tls_verify"):
+        if key not in backend_spec:
+            continue
+        value = backend_spec[key]
+        if key in ("model", "auth") and value == "":
+            current.pop(key, None)
+        elif key == "weight":
+            current[key] = float(value)
+        elif key == "tls_verify":
+            current[key] = bool(value)
+        else:
+            current[key] = value
+    if not current.get("url"):
+        raise ValueError("backend.url is required")
+    backends[index] = current
