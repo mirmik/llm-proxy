@@ -27,6 +27,45 @@ class RouterSessionMarkerTests(unittest.TestCase):
         self.assertEqual(session_id, "qwen-session")
         self.assertEqual(source, "metadata.sessionId")
 
+    def test_extracts_qwen_subagent_session_from_prompt_id(self):
+        body = {
+            "metadata": {
+                "sessionId": "parent-session",
+                "promptId": "parent-session#Explore-a1b2c3d4#2",
+            },
+        }
+
+        session_id, source = _extract_session_marker(body)
+
+        self.assertEqual(session_id, "parent-session#Explore-a1b2c3d4")
+        self.assertEqual(source, "metadata.promptId:qwen")
+
+    def test_extracts_qwen_main_session_from_prompt_id_delimiter(self):
+        body = {
+            "metadata": {
+                "sessionId": "parent-session",
+                "promptId": "parent-session########0",
+            },
+        }
+
+        session_id, source = _extract_session_marker(body)
+
+        self.assertEqual(session_id, "parent-session")
+        self.assertEqual(source, "metadata.promptId:qwen")
+
+    def test_ignores_non_qwen_prompt_id_shape(self):
+        body = {
+            "metadata": {
+                "sessionId": "parent-session",
+                "promptId": "not-a-qwen-prompt-id",
+            },
+        }
+
+        session_id, source = _extract_session_marker(body)
+
+        self.assertEqual(session_id, "parent-session")
+        self.assertEqual(source, "metadata.sessionId")
+
     def test_extracts_header_session_id(self):
         body = {"model": "model"}
         headers = {"X-LLM-Proxy-Session-ID": "header-session"}

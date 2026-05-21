@@ -40,6 +40,7 @@ _SESSION_HEADER_KEYS = (
     "X-Chat-ID",
     "X-Chat-Id",
 )
+_QWEN_MAIN_PROMPT_DELIMITER = "########"
 
 
 def _setup_app(rm, sm, auth, routes=None):
@@ -87,6 +88,23 @@ def _coerce_session_value(value):
     return None
 
 
+def _qwen_prompt_session(prompt_id):
+    """Derive a stable routing key from qwen-code metadata.promptId."""
+    prompt_id = _coerce_session_value(prompt_id)
+    if not prompt_id:
+        return None
+
+    delimiter_at = prompt_id.find(_QWEN_MAIN_PROMPT_DELIMITER)
+    if delimiter_at > 0:
+        return prompt_id[:delimiter_at]
+
+    parts = prompt_id.split("#")
+    if len(parts) >= 3 and parts[0] and parts[1] and parts[2].isdigit():
+        return f"{parts[0]}#{parts[1]}"
+
+    return None
+
+
 def _extract_session_marker(body, headers=None):
     """Return (session_id, source) from common OpenAI-compatible extensions."""
     if isinstance(body, dict):
@@ -97,6 +115,10 @@ def _extract_session_marker(body, headers=None):
 
         metadata = body.get("metadata")
         if isinstance(metadata, dict):
+            session_id = _qwen_prompt_session(metadata.get("promptId"))
+            if session_id:
+                return session_id, "metadata.promptId:qwen"
+
             for key in _SESSION_METADATA_KEYS:
                 session_id = _coerce_session_value(metadata.get(key))
                 if session_id:
