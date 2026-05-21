@@ -32,6 +32,14 @@ DEFAULT_CONFIG = {
     "runtimes": {},
     "hosts": {},
     "routes": {},
+    "kv_cache": {
+        "cleanup_enabled": True,
+        "ttl_hours": 168,
+        "cleanup_interval_minutes": 30,
+        "max_total_gb": None,
+        "max_per_runtime_gb": None,
+        "keep_active_sessions": True,
+    },
 }
 
 

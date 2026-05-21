@@ -11,6 +11,36 @@ from llm_proxy.certs import certificate_fingerprint, generate_server_cert
 from llm_proxy.config import load_config_file, save_config_file
 from llm_proxy.oplog import elapsed_ms, log_event, now
 
+_SESSION_BODY_KEYS = (
+    "session_id",
+    "sessionId",
+    "session",
+    "conversation_id",
+    "conversationId",
+    "chat_id",
+    "chatId",
+)
+_SESSION_METADATA_KEYS = (
+    "session_id",
+    "sessionId",
+    "session",
+    "conversation_id",
+    "conversationId",
+    "chat_id",
+    "chatId",
+)
+_SESSION_HEADER_KEYS = (
+    "X-LLM-Proxy-Session-ID",
+    "X-Session-ID",
+    "X-Session-Id",
+    "X-Qwen-Session-ID",
+    "X-Qwen-Session-Id",
+    "X-Conversation-ID",
+    "X-Conversation-Id",
+    "X-Chat-ID",
+    "X-Chat-Id",
+)
+
 
 def _setup_app(rm, sm, auth, routes=None):
     max_size = int((getattr(rm, "config", {}) or {}).get("client_max_size", 64 * 1024 * 1024))
@@ -48,6 +78,60 @@ def _session_label(session_id):
     return f"{text[:8]}..{text[-4:]}"
 
 
+def _coerce_session_value(value):
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (str, int, float)):
+        text = str(value).strip()
+        return text or None
+    return None
+
+
+def _extract_session_marker(body, headers=None):
+    """Return (session_id, source) from common OpenAI-compatible extensions."""
+    if isinstance(body, dict):
+        for key in _SESSION_BODY_KEYS:
+            session_id = _coerce_session_value(body.get(key))
+            if session_id:
+                return session_id, f"body.{key}"
+
+        metadata = body.get("metadata")
+        if isinstance(metadata, dict):
+            for key in _SESSION_METADATA_KEYS:
+                session_id = _coerce_session_value(metadata.get(key))
+                if session_id:
+                    return session_id, f"metadata.{key}"
+
+    if headers:
+        for key in _SESSION_HEADER_KEYS:
+            session_id = _coerce_session_value(headers.get(key))
+            if session_id:
+                return session_id, f"header.{key}"
+
+    return None, None
+
+
+def _strip_local_session_markers(body):
+    """Remove llm-proxy session extensions before sending to local llama.cpp."""
+    if not isinstance(body, dict):
+        return body
+    for key in _SESSION_BODY_KEYS:
+        body.pop(key, None)
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        for key in _SESSION_METADATA_KEYS:
+            metadata.pop(key, None)
+        if not metadata:
+            body.pop("metadata", None)
+    return body
+
+
+def _add_session_header(headers, session_id):
+    if session_id and "X-LLM-Proxy-Session-ID" not in headers:
+        headers["X-LLM-Proxy-Session-ID"] = session_id
+    return headers
+
+
 def create_api_app(runtime_manager, slot_manager, auth_manager=None, route_manager=None):
     """Public API surface: inference + discovery. Token-gated when auth.enabled."""
     app = _setup_app(runtime_manager, slot_manager, auth_manager, routes=route_manager)
@@ -79,6 +163,7 @@ def create_control_app(runtime_manager, slot_manager, auth_manager=None, route_m
     app.router.add_post("/v1/control/runtimes/{name}/settings", handle_runtime_settings)
     app.router.add_get("/v1/control/runtimes/{name}/logs", handle_runtime_logs)
     app.router.add_get("/v1/control/state", handle_control_state)
+    app.router.add_post("/v1/control/kv-cache/cleanup", handle_kv_cache_cleanup)
     app.router.add_post("/v1/control/models/{name}/load", handle_load)
     app.router.add_post("/v1/control/models/{name}/unload", handle_unload)
     app.router.add_get("/v1/control/whoami", handle_control_whoami)
@@ -150,7 +235,7 @@ async def handle_chat(request):
 
     body = await request.json()
     model_name = body.get("model", "")
-    session_id = body.pop("session_id", None)
+    session_id, session_source = _extract_session_marker(body, request.headers)
     stream = body.get("stream", False)
     host = _client_host(request)
     log_event(
@@ -159,6 +244,7 @@ async def handle_chat(request):
         host=host,
         model=model_name,
         session=_session_label(session_id),
+        session_source=session_source,
         stream=stream,
     )
 
@@ -171,7 +257,15 @@ async def handle_chat(request):
         route = route_manager.get_route(model_name)
         if route:
             log_event("request route", kind="chat", host=host, model=model_name, route=route.name)
-            return await _proxy_routed(request, route, body, stream, request_started)
+            return await _proxy_routed(
+                request,
+                route,
+                body,
+                stream,
+                request_started,
+                session_id=session_id,
+                session_source=session_source,
+            )
 
     if not rm.is_running(model_name):
         if rm.on_demand(model_name):
@@ -203,6 +297,7 @@ async def handle_chat(request):
         )
 
     slot_id = await _acquire_slot(rm, sm, model_name, session_id, port)
+    _strip_local_session_markers(body)
     if slot_id is not None:
         body["id_slot"] = slot_id
 
@@ -214,6 +309,8 @@ async def handle_chat(request):
         model=model_name,
         backend=_backend_label(backend_url),
         slot=slot_id,
+        session=_session_label(session_id),
+        session_source=session_source,
         stream=stream,
     )
 
@@ -236,7 +333,15 @@ async def handle_chat(request):
             await sm.release(model_name, slot_id)
 
 
-async def _proxy_routed(request, route, body, stream, request_started=None):
+async def _proxy_routed(
+    request,
+    route,
+    body,
+    stream,
+    request_started=None,
+    session_id=None,
+    session_source=None,
+):
     """Forward request through a Route's failover chain."""
     from llm_proxy.route_manager import _derive_endpoint_url
 
@@ -246,6 +351,7 @@ async def _proxy_routed(request, route, body, stream, request_started=None):
         url = _derive_endpoint_url(backend["url"], route.kind)
         body["model"] = backend.get("model", route.name)
         headers = route._auth_headers(backend)
+        _add_session_header(headers, session_id)
         host = _client_host(request)
         log_event(
             "request forward",
@@ -254,6 +360,8 @@ async def _proxy_routed(request, route, body, stream, request_started=None):
             model=body["model"],
             route=route.name,
             backend=_backend_label(url),
+            session=_session_label(session_id),
+            session_source=session_source,
             stream=stream,
         )
         try:
@@ -983,6 +1091,21 @@ async def handle_control_state(request):
     runtimes = rm.list_state()
     models = [rt for rt in runtimes if rt["kind"] == "llm"]
     return web.json_response({"models": models, "runtimes": runtimes})
+
+
+async def handle_kv_cache_cleanup(request):
+    """POST /v1/control/kv-cache/cleanup — run KV cache cleanup now."""
+    _require_control_auth(request)
+    manager = request.app.get("kv_cache")
+    if manager is None:
+        return web.json_response({"error": "kv cache manager is not available"}, status=500)
+    result = await manager.cleanup_once(reason="manual")
+    return web.json_response({
+        "ok": True,
+        "scanned": result.scanned,
+        "deleted": result.deleted,
+        "bytes_deleted": result.bytes_deleted,
+    })
 
 
 async def handle_runtimes(request):

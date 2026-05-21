@@ -40,6 +40,19 @@ class SlotManager:
                 return slot_id
         return None
 
+    def active_sessions(self):
+        """Return model_name -> set(session_id) currently assigned to slots."""
+        active = {}
+        for model_name, slots in self._slots.items():
+            sessions = {
+                str(info["session"])
+                for info in slots.values()
+                if info.get("session") is not None
+            }
+            if sessions:
+                active[model_name] = sessions
+        return active
+
     async def acquire(self, model_name, session_id, port):
         """Acquire an exclusive slot lease for a session. Returns slot_id.
 

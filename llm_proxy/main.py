@@ -10,6 +10,7 @@ from aiohttp import web
 from llm_proxy.auth import AuthManager
 from llm_proxy.certs import certificate_fingerprint, generate_server_cert, make_ssl_context
 from llm_proxy.config import load_config
+from llm_proxy.kv_cache_manager import KVCacheManager
 from llm_proxy.resource_coordinator import ResourceCoordinator
 from llm_proxy.route_manager import RouteManager
 from llm_proxy.runtime_manager import RuntimeManager
@@ -23,11 +24,13 @@ async def run(config):
     sm = SlotManager()
     auth = AuthManager(config)
     routes = RouteManager(config)
+    kv_cache = KVCacheManager(config, sm)
     coordinator.register("runtime", rm.list_running_on_gpu, rm.stop)
     api_app = create_api_app(rm, sm, auth, route_manager=routes)
     control_app = create_control_app(rm, sm, auth, route_manager=routes)
     api_app["config"] = config
     control_app["config"] = config
+    control_app["kv_cache"] = kv_cache
 
     listen = config["listen"]
     api_host = listen["host"] if isinstance(listen, dict) else "0.0.0.0"
@@ -59,6 +62,7 @@ async def run(config):
         print(f"  TLS fingerprint: {certificate_fingerprint(tls_cfg['cert_file'])}")
     asyncio.create_task(rm.autostart())
     await routes.start_monitoring()
+    await kv_cache.start()
 
     stop = asyncio.Event()
     loop = asyncio.get_event_loop()
@@ -67,6 +71,8 @@ async def run(config):
 
     await stop.wait()
     print("\n  Shutting down...")
+
+    await kv_cache.stop()
 
     for name in rm.loaded_models():
         port = rm.get_port(name)
