@@ -172,7 +172,6 @@
   .runtime-card .actions { margin-top: auto; }
   .runtime-card .actions button { padding: 5px 10px; font-size: 0.82rem; }
   .runtime-card pre.logs { background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; padding: 10px; max-height: 240px; overflow: auto; font-size: 0.78rem; white-space: pre-wrap; margin: 8px 0 0; }
-  .runtime-card .rt-profile { margin-top: 4px; }
   .runtime-card .rt-settings { margin-top: 4px; border-top: 1px solid var(--border-soft); padding-top: 8px; }
   .runtime-card .rt-settings > summary { cursor: pointer; color: var(--text-muted); font-size: 0.85rem; padding: 4px 0; user-select: none; }
   .runtime-card .rt-settings[open] > summary { color: var(--text); }
@@ -262,7 +261,6 @@
           </select>
         </div>
         <div class="field"><label>GPU group</label><input id="nr-gpu" placeholder="local"></div>
-        <div class="field"><label>Profile name</label><input id="nr-profile" placeholder="default"></div>
         <div class="field"><label>Autoload</label>
           <select id="nr-autoload"><option value="false">false</option><option value="true">true</option></select>
         </div>
@@ -686,22 +684,13 @@
     const running = r.running || r.status === "running";
     const settings = r.settings || {};
     const kind = r.kind || settings.kind || "llm";
-    const profile = r.profile || r.default_profile || "default";
     const port = settings.port ?? r.port ?? "—";
-    const profiles = r.profiles || [];
     const badges = [];
     badges.push(`<span class="badge ${running ? "running" : "stopped"}">${running ? "running" : "stopped"}</span>`);
     badges.push(`<span class="badge">${escapeHtml(kind)}</span>`);
     if (settings.autoload) badges.push(`<span class="badge autoload">autoload</span>`);
     if (settings.on_demand) badges.push(`<span class="badge">on-demand</span>`);
     if (r.gpu) badges.push(`<span class="badge">gpu: ${escapeHtml(r.gpu)}</span>`);
-    const profileSel = profiles.length > 1
-      ? `<div class="rt-profile field">
-           <label>Active profile</label>
-           <select data-profile-select="${escapeHtml(r.name)}">
-             ${profiles.map(p => `<option value="${escapeHtml(p)}" ${p === profile ? "selected" : ""}>${escapeHtml(p)}</option>`).join("")}
-           </select>
-         </div>` : "";
     const slotsField = (kind === "llm")
       ? `<div class="field"><label>Slots</label><input data-setting="slots" data-name="${escapeHtml(r.name)}" value="${escapeHtml(String(settings.slots ?? ""))}"></div>`
       : "";
@@ -711,8 +700,7 @@
     div.innerHTML = `
       <div class="name">${escapeHtml(r.name)}</div>
       <div class="badges">${badges.join("")}</div>
-      <div class="meta">profile: ${escapeHtml(profile)} · port: ${escapeHtml(String(port))} · driver: ${escapeHtml(r.driver || "—")}${r.health_url ? " · health: " + escapeHtml(r.health_url) : ""}</div>
-      ${profileSel}
+      <div class="meta">port: ${escapeHtml(String(port))} · driver: ${escapeHtml(r.driver || "—")}${r.health_url ? " · health: " + escapeHtml(r.health_url) : ""}</div>
       <div class="actions">
         ${running
           ? `<button class="danger" data-action="stop" data-name="${escapeHtml(r.name)}">Stop</button>`
@@ -790,19 +778,6 @@
     } catch (err) { setMsg(stateMsg, action + " failed: " + err.message, "error"); }
   });
 
-  runtimesEl.addEventListener("change", async (e) => {
-    const sel = e.target.dataset && e.target.dataset.profileSelect;
-    if (!sel) return;
-    try {
-      await api(`/v1/control/runtimes/${encodeURIComponent(sel)}/select-profile`, {
-        method: "POST",
-        body: JSON.stringify({profile: e.target.value}),
-      });
-      setMsg(stateMsg, `Switched profile for ${sel} to ${e.target.value}.`, "ok");
-      await refreshState();
-    } catch (err) { setMsg(stateMsg, "Profile switch failed: " + err.message, "error"); }
-  });
-
   document.getElementById("refreshBtn").addEventListener("click", refreshState);
 
   // ---------- new runtime form ----------
@@ -843,14 +818,11 @@
       gpu: document.getElementById("nr-gpu").value || "local",
       autoload: document.getElementById("nr-autoload").value === "true",
       on_demand: document.getElementById("nr-ondemand").value === "true",
-      profile: {
-        name: document.getElementById("nr-profile").value || "default",
-        port: parseInt(port, 10),
-        slots: parseInt(document.getElementById("nr-slots").value || "1", 10),
-        venv: document.getElementById("nr-venv").value || null,
-        command,
-        env,
-      },
+      port: parseInt(port, 10),
+      slots: parseInt(document.getElementById("nr-slots").value || "1", 10),
+      venv: document.getElementById("nr-venv").value || null,
+      command,
+      env,
     };
     try {
       await api("/v1/control/runtimes", {method: "POST", body: JSON.stringify(body)});

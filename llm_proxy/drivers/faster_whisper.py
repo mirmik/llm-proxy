@@ -1,6 +1,6 @@
 """faster-whisper runtime driver — thin pass-through.
 
-Command and env are fully controlled by profile.command / profile.env.
+Command and env are fully controlled by runtime.command / runtime.env.
 Available placeholders: {port}, {name}, {cache_dir}, {state_dir},
 {python}, {runtime_kv}, {slots}, {defaults.*}.
 """
@@ -15,7 +15,7 @@ class FasterWhisperDriver(RuntimeDriver):
     def kind(self):
         return "stt"
 
-    def runtime_meta(self, runtime_name, profile, global_config):
-        meta = super().runtime_meta(runtime_name, profile, global_config)
-        meta["python_bin"] = resolve_python_bin(profile)
+    def runtime_meta(self, runtime_name, runtime, global_config):
+        meta = super().runtime_meta(runtime_name, runtime, global_config)
+        meta["python_bin"] = resolve_python_bin(runtime)
         return meta

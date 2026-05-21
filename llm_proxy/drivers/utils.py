@@ -5,20 +5,20 @@ import shlex
 import sys
 
 
-def resolve_python_bin(profile):
-    """Resolve interpreter path from profile fields."""
-    python_bin = profile.get("python_bin")
+def resolve_python_bin(runtime):
+    """Resolve interpreter path from runtime fields."""
+    python_bin = runtime.get("python_bin")
     if python_bin:
         return os.path.expanduser(str(python_bin))
 
-    venv = profile.get("venv")
+    venv = runtime.get("venv")
     if venv:
         return os.path.join(os.path.expanduser(str(venv)), "bin", "python")
 
     return sys.executable
 
 
-def build_substitutions(runtime_name, profile, global_config):
+def build_substitutions(runtime_name, runtime, global_config):
     """Build the placeholder map available in command/env templates.
 
     Flat keys:
@@ -35,13 +35,13 @@ def build_substitutions(runtime_name, profile, global_config):
     runners_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "runners")
 
     subs = {
-        "port": profile.get("port", ""),
+        "port": runtime.get("port", ""),
         "name": runtime_name,
         "cache_dir": cache_dir,
         "state_dir": state_dir,
-        "python": resolve_python_bin(profile),
+        "python": resolve_python_bin(runtime),
         "runtime_kv": runtime_kv,
-        "slots": profile.get("slots", 1),
+        "slots": runtime.get("slots", 1),
         "runners_dir": runners_dir,
         "defaults": DottedDict(global_config.get("defaults") or {}),
     }

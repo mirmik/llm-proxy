@@ -23,7 +23,6 @@ def configure_subparsers(subparsers):
 
     start = subparsers.add_parser("start", help="Start a runtime")
     start.add_argument("runtime", help="Runtime name")
-    start.add_argument("--profile", help="Select profile before starting")
     add_control_args(start)
 
     stop = subparsers.add_parser("stop", help="Stop a runtime")
@@ -32,7 +31,6 @@ def configure_subparsers(subparsers):
 
     restart = subparsers.add_parser("restart", help="Restart a runtime")
     restart.add_argument("runtime", help="Runtime name")
-    restart.add_argument("--profile", help="Select profile before restarting")
     add_control_args(restart)
 
     logs = subparsers.add_parser("logs", help="Show buffered runtime logs")
@@ -74,8 +72,6 @@ async def run_control_command(args, config):
             print_status(data)
             return 0
         if args.command == "start":
-            if args.profile:
-                await client.post(f"/v1/control/runtimes/{quote(args.runtime, safe='')}/select-profile", {"profile": args.profile})
             data = await client.post(f"/v1/control/runtimes/{quote(args.runtime, safe='')}/start")
             print_runtime(data.get("runtime"))
             return 0
@@ -85,8 +81,6 @@ async def run_control_command(args, config):
             return 0
         if args.command == "restart":
             await client.post(f"/v1/control/runtimes/{quote(args.runtime, safe='')}/stop")
-            if args.profile:
-                await client.post(f"/v1/control/runtimes/{quote(args.runtime, safe='')}/select-profile", {"profile": args.profile})
             data = await client.post(f"/v1/control/runtimes/{quote(args.runtime, safe='')}/start")
             print_runtime(data.get("runtime"))
             return 0
@@ -165,14 +159,13 @@ def print_status(data):
             rt.get("name", ""),
             rt.get("status", ""),
             rt.get("kind", ""),
-            rt.get("profile", "") or "",
             str(rt.get("port") or ""),
             str(rt.get("slots") or rt.get("settings", {}).get("slots") or ""),
             str(rt.get("pid") or ""),
         ]
         for rt in runtimes
     ]
-    print_table(["name", "status", "kind", "profile", "port", "slots", "pid"], rows)
+    print_table(["name", "status", "kind", "port", "slots", "pid"], rows)
 
 
 def print_runtime(runtime):
@@ -181,7 +174,6 @@ def print_runtime(runtime):
     print(
         f"{runtime.get('name')}: "
         f"{runtime.get('status')} "
-        f"profile={runtime.get('profile') or '-'} "
         f"port={runtime.get('port') or '-'} "
         f"pid={runtime.get('pid') or '-'}"
     )

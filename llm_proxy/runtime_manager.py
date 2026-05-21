@@ -2,7 +2,6 @@
 
 import asyncio
 import copy
-import json
 import os
 import re
 import signal
@@ -27,13 +26,10 @@ class RuntimeManager:
         self.coordinator = coordinator
         self.drivers = build_driver_registry()
         self.state_dir = os.path.expanduser(config["state_dir"])
-        self._state_path = os.path.join(self.state_dir, "runtime_state.json")
         self.runtimes = self._build_runtimes(config)
-        self._profiles = {}
         self._processes = {}
         self._logs = {}
         self._meta = {}
-        self._load_state()
 
     def available_runtimes(self):
         return list(self.runtimes.keys())
@@ -54,17 +50,6 @@ class RuntimeManager:
         proc = self._processes.get(runtime_name)
         return proc is not None and proc.returncode is None
 
-    def current_profile(self, runtime_name):
-        runtime = self.runtimes[runtime_name]
-        if runtime_name in self._profiles:
-            return self._profiles[runtime_name]
-        if runtime.get("default_profile"):
-            return runtime["default_profile"]
-        profiles = runtime.get("profiles") or {}
-        if profiles:
-            return next(iter(profiles))
-        return None
-
     def driver_for(self, runtime_name):
         driver_name = self.runtimes[runtime_name]["driver"]
         driver = self.drivers.get(driver_name)
@@ -77,26 +62,23 @@ class RuntimeManager:
         return meta.get("port")
 
     def get_slots(self, runtime_name):
-        runtime = self.runtimes[runtime_name]
-        profile = self.resolve_profile(runtime_name)
-        return int(profile.get("slots", 1))
+        runtime = self.runtime_config(runtime_name)
+        return int(runtime.get("slots", 1))
 
     def runtime_state(self, runtime_name):
         runtime = self.runtimes[runtime_name]
         driver = self.driver_for(runtime_name)
-        profile = self.resolve_profile(runtime_name)
+        runtime_cfg = self.runtime_config(runtime_name)
         meta = dict(self._meta.get(runtime_name) or {})
         return {
             "name": runtime_name,
             "driver": runtime["driver"],
             "kind": driver.kind(),
             "status": "running" if self.is_running(runtime_name) else "stopped",
-            "profile": self.current_profile(runtime_name),
-            "profiles": list((runtime.get("profiles") or {}).keys()),
             "autoload": bool(runtime.get("autoload", False)),
             "on_demand": self.on_demand(runtime_name),
-            "gpu": profile.get("gpu"),
-            "health_url": driver.resolve_health_url(runtime_name, profile, self.config),
+            "gpu": runtime_cfg.get("gpu"),
+            "health_url": driver.resolve_health_url(runtime_name, runtime_cfg, self.config),
             "pid": self._processes.get(runtime_name).pid if self.is_running(runtime_name) else None,
             "settings": self._editable_settings(runtime_name),
             **meta,
@@ -117,8 +99,8 @@ class RuntimeManager:
         for name in self.available_runtimes():
             if not self.is_running(name):
                 continue
-            profile = self.resolve_profile(name)
-            if profile.get("gpu") == gpu:
+            runtime_cfg = self.runtime_config(name)
+            if runtime_cfg.get("gpu") == gpu:
                 running.append(name)
         return running
 
@@ -141,20 +123,19 @@ class RuntimeManager:
         started = now()
         runtime = self.runtimes[runtime_name]
         driver = self.driver_for(runtime_name)
-        profile = self.resolve_profile(runtime_name)
-        driver.validate_profile(profile)
+        runtime_cfg = self.runtime_config(runtime_name)
+        driver.validate_runtime(runtime_cfg)
 
-        argv = driver.build_command(runtime_name, profile, self.config)
+        argv = driver.build_command(runtime_name, runtime_cfg, self.config)
         env = os.environ.copy()
-        env.update(driver.build_env(runtime_name, profile, self.config))
+        env.update(driver.build_env(runtime_name, runtime_cfg, self.config))
         self._logs.setdefault(runtime_name, deque(maxlen=200))
         self._append_log(runtime_name, f"$ {' '.join(argv)}")
         log_event(
             "runtime start",
             runtime=runtime_name,
             driver=runtime["driver"],
-            profile=self.current_profile(runtime_name),
-            port=profile.get("port"),
+            port=runtime_cfg.get("port"),
         )
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -163,12 +144,12 @@ class RuntimeManager:
             stderr=asyncio.subprocess.STDOUT,
         )
         self._processes[runtime_name] = proc
-        self._meta[runtime_name] = driver.runtime_meta(runtime_name, profile, self.config)
+        self._meta[runtime_name] = driver.runtime_meta(runtime_name, runtime_cfg, self.config)
         asyncio.create_task(self._log_output(runtime_name, proc))
 
-        health_url = driver.resolve_health_url(runtime_name, profile, self.config)
+        health_url = driver.resolve_health_url(runtime_name, runtime_cfg, self.config)
         if health_url:
-            timeout = float(driver.startup_timeout(runtime_name, profile))
+            timeout = float(driver.startup_timeout(runtime_name, runtime_cfg))
             if not await self._wait_healthy(health_url, timeout=timeout):
                 await self.stop(runtime_name)
                 raise TimeoutError(f"{runtime_name} failed to start within {timeout}s")
@@ -185,8 +166,8 @@ class RuntimeManager:
 
         started = now()
         driver = self.driver_for(runtime_name)
-        profile = self.resolve_profile(runtime_name)
-        stop_signal = str(driver.stop_signal(runtime_name, profile)).upper()
+        runtime_cfg = self.runtime_config(runtime_name)
+        stop_signal = str(driver.stop_signal(runtime_name, runtime_cfg)).upper()
         sig = getattr(signal, stop_signal, signal.SIGTERM)
 
         self._append_log(runtime_name, f"[stopping] signal={stop_signal}")
@@ -212,19 +193,6 @@ class RuntimeManager:
             await self.start(runtime_name)
         return self.get_port(runtime_name)
 
-    async def select_profile(self, runtime_name, profile_name):
-        runtime = self.runtimes.get(runtime_name)
-        if not runtime:
-            raise ValueError(f"Unknown runtime: {runtime_name}")
-        profiles = runtime.get("profiles") or {}
-        if profile_name not in profiles:
-            raise ValueError(f"Unknown profile for {runtime_name}: {profile_name}")
-        self._profiles[runtime_name] = profile_name
-        self._save_state()
-        if self.is_running(runtime_name):
-            await self.stop(runtime_name)
-            await self.start(runtime_name)
-
     async def create_runtime(self, spec):
         """Create a new runtime and persist it to the config file.
 
@@ -234,8 +202,7 @@ class RuntimeManager:
           gpu (optional)
           autoload (optional)
           on_demand (optional)
-          profile_name (optional) — defaults to 'default'
-          profile (required)      — profile dict with at least port+command
+          port, command, slots?, venv?, python_bin?, env?, ...
         """
         config_path = self.config.get("_config_path")
         if not config_path:
@@ -253,19 +220,16 @@ class RuntimeManager:
         if driver_name not in self.drivers:
             raise ValueError(f"Unknown driver: {driver_name!r}. Available: {sorted(self.drivers)}")
 
-        profile_name = str(spec.get("profile_name") or "default").strip() or "default"
-        profile = spec.get("profile") or {}
-        if not isinstance(profile, dict):
-            raise ValueError("'profile' must be an object")
-        if not profile.get("command"):
-            raise ValueError("profile.command is required")
-        if not profile.get("port"):
-            raise ValueError("profile.port is required")
+        runtime_fields = _runtime_fields_from_spec(spec)
+        if not runtime_fields.get("command"):
+            raise ValueError("command is required")
+        if not runtime_fields.get("port"):
+            raise ValueError("port is required")
         try:
-            port = int(profile["port"])
+            port = int(runtime_fields["port"])
         except (TypeError, ValueError):
-            raise ValueError("profile.port must be an integer")
-        profile["port"] = port
+            raise ValueError("port must be an integer")
+        runtime_fields["port"] = port
 
         raw = load_config_file(config_path)
         runtimes = raw.setdefault("runtimes", {}) or {}
@@ -273,14 +237,13 @@ class RuntimeManager:
         if name in runtimes:
             raise ValueError(f"Runtime {name!r} already exists")
 
-        # Optional: warn about port collision with another configured runtime.
         for other_name, other in runtimes.items():
-            for _, other_profile in (other.get("profiles") or {}).items():
-                if int(other_profile.get("port", 0)) == port:
-                    raise ValueError(
-                        f"Port {port} is already used by runtime {other_name!r}. "
-                        f"Choose another port."
-                    )
+            other_runtime = _collapse_legacy_runtime(other)
+            if int(other_runtime.get("port", 0)) == port:
+                raise ValueError(
+                    f"Port {port} is already used by runtime {other_name!r}. "
+                    f"Choose another port."
+                )
 
         entry = {"driver": driver_name}
         if spec.get("gpu") not in (None, ""):
@@ -289,8 +252,7 @@ class RuntimeManager:
             entry["autoload"] = bool(spec["autoload"])
         if "on_demand" in spec:
             entry["on_demand"] = bool(spec["on_demand"])
-        entry["default_profile"] = profile_name
-        entry["profiles"] = {profile_name: profile}
+        entry.update(runtime_fields)
         runtimes[name] = entry
 
         save_config_file(config_path, raw)
@@ -314,9 +276,7 @@ class RuntimeManager:
         raw["runtimes"] = runtimes
         save_config_file(config_path, raw)
 
-        self._profiles.pop(runtime_name, None)
         self._logs.pop(runtime_name, None)
-        self._save_state()
         self._reload_from_disk()
 
     async def update_settings(self, runtime_name, settings):
@@ -328,17 +288,12 @@ class RuntimeManager:
         if not config_path:
             raise ValueError("No writable config path is associated with the running server")
 
-        current_profile = self.current_profile(runtime_name)
-        if not current_profile:
-            raise ValueError(f"Runtime {runtime_name} has no active profile")
-
         raw = load_config_file(config_path)
         runtimes = raw.setdefault("runtimes", {})
         raw_runtime = runtimes.get(runtime_name)
         if not raw_runtime:
             raise ValueError(f"Runtime {runtime_name} is missing from config file")
-        raw_profiles = raw_runtime.setdefault("profiles", {})
-        raw_profile = raw_profiles.setdefault(current_profile, {})
+        raw_runtime = _collapse_legacy_runtime(raw_runtime)
 
         if "autoload" in settings:
             raw_runtime["autoload"] = bool(settings["autoload"])
@@ -351,19 +306,21 @@ class RuntimeManager:
             if key == "env":
                 env_dict = _parse_env(value)
                 if env_dict:
-                    raw_profile["env"] = env_dict
+                    raw_runtime["env"] = env_dict
                 else:
-                    raw_profile.pop("env", None)
+                    raw_runtime.pop("env", None)
                 continue
             if value in ("", None):
-                raw_profile.pop(key, None)
+                raw_runtime.pop(key, None)
                 continue
             if key in {"port", "slots", "sample_rate"}:
-                raw_profile[key] = int(value)
+                raw_runtime[key] = int(value)
             elif key == "startup_timeout":
-                raw_profile[key] = float(value)
+                raw_runtime[key] = float(value)
             else:
-                raw_profile[key] = value
+                raw_runtime[key] = value
+
+        runtimes[runtime_name] = raw_runtime
 
         save_config_file(config_path, raw)
         running = self.is_running(runtime_name)
@@ -373,34 +330,25 @@ class RuntimeManager:
         if running:
             await self.start(runtime_name)
 
-    def resolve_profile(self, runtime_name):
+    def runtime_config(self, runtime_name):
         runtime = self.runtimes[runtime_name]
-        profile_name = self.current_profile(runtime_name)
-        base = copy.deepcopy(runtime.get("base", {}))
-        profile = copy.deepcopy((runtime.get("profiles") or {}).get(profile_name, {}))
-        merged = base
-        merged.update(profile)
-        if "gpu" not in merged and runtime.get("gpu"):
-            merged["gpu"] = runtime["gpu"]
-        return merged
+        return _collapse_legacy_runtime(runtime)
 
     def _editable_settings(self, runtime_name):
         runtime = self.runtimes[runtime_name]
         driver = self.driver_for(runtime_name)
-        profile = self.resolve_profile(runtime_name)
-        current_profile = self.current_profile(runtime_name)
+        runtime_cfg = self.runtime_config(runtime_name)
         return {
             "autoload": bool(runtime.get("autoload", False)),
             "on_demand": bool(runtime.get("on_demand", False)),
-            "profile_name": current_profile,
             "kind": driver.kind(),
-            "port": profile.get("port"),
-            "slots": profile.get("slots"),
-            "venv": profile.get("venv"),
-            "python_bin": profile.get("python_bin"),
-            "command": profile.get("command"),
-            "env": profile.get("env") or {},
-            "startup_timeout": profile.get("startup_timeout"),
+            "port": runtime_cfg.get("port"),
+            "slots": runtime_cfg.get("slots"),
+            "venv": runtime_cfg.get("venv"),
+            "python_bin": runtime_cfg.get("python_bin"),
+            "command": runtime_cfg.get("command"),
+            "env": runtime_cfg.get("env") or {},
+            "startup_timeout": runtime_cfg.get("startup_timeout"),
         }
 
     def _build_runtimes(self, config):
@@ -411,24 +359,6 @@ class RuntimeManager:
         reloaded = load_config(config_path)
         self.config = reloaded
         self.runtimes = self._build_runtimes(reloaded)
-
-    def _load_state(self):
-        if not os.path.isfile(self._state_path):
-            return
-        try:
-            with open(self._state_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except Exception:
-            return
-        self._profiles = payload.get("profiles") or {}
-
-    def _save_state(self):
-        os.makedirs(self.state_dir, exist_ok=True)
-        tmp = self._state_path + ".tmp"
-        payload = {"profiles": self._profiles}
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
-        os.replace(tmp, self._state_path)
 
     def _append_log(self, runtime_name, line):
         self._logs.setdefault(runtime_name, deque(maxlen=200)).append(line)
@@ -481,3 +411,43 @@ def _parse_env(value):
             raise ValueError(f"Empty env key in line: {raw!r}")
         out[key] = val
     return out
+
+
+def _runtime_fields_from_spec(spec):
+    legacy = spec.get("profile")
+    if isinstance(legacy, dict):
+        out = copy.deepcopy(legacy)
+        out.pop("name", None)
+    else:
+        out = {}
+    for key, value in spec.items():
+        if key in {"name", "driver", "gpu", "autoload", "on_demand", "profile", "profile_name", "kind"}:
+            continue
+        out[key] = value
+    return out
+
+
+def _collapse_legacy_runtime(runtime):
+    if not isinstance(runtime, dict) or "profiles" not in runtime:
+        return copy.deepcopy(runtime)
+
+    profiles = runtime.get("profiles") or {}
+    profile_name = "default"
+    if profile_name not in profiles:
+        configured = runtime.get("default_profile")
+        if configured in profiles:
+            profile_name = configured
+        elif len(profiles) == 1:
+            profile_name = next(iter(profiles))
+
+    base = runtime.get("base") or {}
+    profile = profiles.get(profile_name) or {}
+    collapsed = {
+        key: copy.deepcopy(value)
+        for key, value in runtime.items()
+        if key not in {"profiles", "default_profile", "base"}
+    }
+    merged = copy.deepcopy(base)
+    merged.update(copy.deepcopy(profile))
+    collapsed.update(merged)
+    return collapsed

@@ -78,12 +78,12 @@ def load_config(path=None):
         if isinstance(value, str):
             defaults[key] = os.path.expanduser(value)
 
-    for name, runtime in (config.get("runtimes") or {}).items():
-        _validate_runtime(name, runtime)
-        base = runtime.get("base") or {}
-        _expand_profile_paths(base)
-        for _, profile in (runtime.get("profiles") or {}).items():
-            _expand_profile_paths(profile)
+    runtimes = config.get("runtimes") or {}
+    for name, runtime in list(runtimes.items()):
+        normalized = _normalize_runtime(runtime)
+        runtimes[name] = normalized
+        _validate_runtime(name, normalized)
+        _expand_runtime_paths(normalized)
 
     for name, route in (config.get("routes") or {}).items():
         _validate_route(name, route)
@@ -111,15 +111,10 @@ def save_config_file(path, payload):
 def _validate_runtime(name, runtime):
     if not runtime.get("driver"):
         raise ValueError(f"Runtime '{name}' is missing 'driver'")
-    profiles = runtime.get("profiles") or {}
-    if not profiles:
-        raise ValueError(f"Runtime '{name}' has no profiles")
-    default_profile = runtime.get("default_profile")
-    if default_profile and default_profile not in profiles:
-        raise ValueError(
-            f"Runtime '{name}' default_profile='{default_profile}' "
-            f"not in profiles {list(profiles)}"
-        )
+    if not runtime.get("command"):
+        raise ValueError(f"Runtime '{name}' is missing 'command'")
+    if not runtime.get("port"):
+        raise ValueError(f"Runtime '{name}' is missing 'port'")
 
 
 def _deep_update(base, override):
@@ -146,9 +141,38 @@ def _validate_route(name, route):
         raise ValueError(f"Route '{name}' has unknown kind: {kind}")
 
 
-def _expand_profile_paths(profile):
-    for key, value in list(profile.items()):
+def _normalize_runtime(runtime):
+    """Collapse legacy profiles/default config into the flat runtime format."""
+    if not isinstance(runtime, dict):
+        return runtime
+    if "profiles" not in runtime:
+        return runtime
+
+    profiles = runtime.get("profiles") or {}
+    profile_name = "default"
+    if profile_name not in profiles:
+        configured = runtime.get("default_profile")
+        if configured in profiles:
+            profile_name = configured
+        elif len(profiles) == 1:
+            profile_name = next(iter(profiles))
+
+    profile = profiles.get(profile_name) or {}
+    base = runtime.get("base") or {}
+    normalized = {
+        key: copy.deepcopy(value)
+        for key, value in runtime.items()
+        if key not in {"profiles", "default_profile", "base"}
+    }
+    merged = copy.deepcopy(base)
+    merged.update(copy.deepcopy(profile))
+    normalized.update(merged)
+    return normalized
+
+
+def _expand_runtime_paths(runtime):
+    for key, value in list(runtime.items()):
         if not isinstance(value, str):
             continue
         if key in {"reference_wav", "python_bin", "workdir", "venv"}:
-            profile[key] = os.path.expanduser(value)
+            runtime[key] = os.path.expanduser(value)

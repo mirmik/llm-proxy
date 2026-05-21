@@ -159,7 +159,6 @@ def create_control_app(runtime_manager, slot_manager, auth_manager=None, route_m
     app.router.add_post("/v1/control/runtimes/{name}/delete", handle_runtime_delete)
     app.router.add_post("/v1/control/runtimes/{name}/start", handle_runtime_start)
     app.router.add_post("/v1/control/runtimes/{name}/stop", handle_runtime_stop)
-    app.router.add_post("/v1/control/runtimes/{name}/select-profile", handle_runtime_select_profile)
     app.router.add_post("/v1/control/runtimes/{name}/settings", handle_runtime_settings)
     app.router.add_get("/v1/control/runtimes/{name}/logs", handle_runtime_logs)
     app.router.add_get("/v1/control/state", handle_control_state)
@@ -1118,34 +1117,32 @@ async def handle_runtimes(request):
 async def handle_runtime_create(request):
     """POST /v1/control/runtimes — create a new runtime.
 
-    Body: {name, driver, gpu?, autoload?, on_demand?, profile_name?,
-           profile: {port, command, slots?, venv?, python_bin?, env?, ...}}
+    Body: {name, driver, gpu?, autoload?, on_demand?,
+           port, command, slots?, venv?, python_bin?, env?, ...}
     env may be a dict or a 'KEY=value' string (one per line).
     """
     _require_control_auth(request)
     rm = request.app["rm"]
     body = await request.json()
 
-    profile = body.get("profile") or {}
-    if "env" in profile:
+    runtime_body = dict(body)
+    profile = runtime_body.get("profile")
+    if isinstance(profile, dict):
+        for key, value in profile.items():
+            if key != "name" and key not in runtime_body:
+                runtime_body[key] = value
+
+    if "env" in runtime_body:
         try:
             from llm_proxy.runtime_manager import _parse_env
-            profile["env"] = _parse_env(profile["env"])
+            runtime_body["env"] = _parse_env(runtime_body["env"])
         except ValueError as e:
             return web.json_response({"error": f"invalid env: {e}"}, status=400)
-        if not profile["env"]:
-            profile.pop("env", None)
+        if not runtime_body["env"]:
+            runtime_body.pop("env", None)
 
     try:
-        await rm.create_runtime({
-            "name": body.get("name"),
-            "driver": body.get("driver"),
-            "gpu": body.get("gpu"),
-            "autoload": body.get("autoload", False),
-            "on_demand": body.get("on_demand", False),
-            "profile_name": body.get("profile_name"),
-            "profile": profile,
-        })
+        await rm.create_runtime(runtime_body)
     except ValueError as e:
         msg = str(e)
         status = 409 if "already exists" in msg else 400
@@ -1193,24 +1190,6 @@ async def handle_runtime_stop(request):
     try:
         await rm.stop(name)
         return web.json_response({"ok": True, "runtime": rm.runtime_state(name)})
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
-
-async def handle_runtime_select_profile(request):
-    """POST /v1/control/runtimes/{name}/select-profile."""
-    _require_control_auth(request)
-    rm = request.app["rm"]
-    name = request.match_info["name"]
-    body = await request.json()
-    profile = body.get("profile")
-    if not profile:
-        return web.json_response({"error": "profile is required"}, status=400)
-    try:
-        await rm.select_profile(name, profile)
-        return web.json_response({"ok": True, "runtime": rm.runtime_state(name)})
-    except ValueError as e:
-        return web.json_response({"error": str(e)}, status=400)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
