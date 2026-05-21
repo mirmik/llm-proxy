@@ -61,8 +61,8 @@ class SlotManager:
         If the session is already loaded in an idle slot, uses it.
         If a free idle slot is available, restores the session into it.
         Otherwise waits for an idle slot, then evicts the LRU session.
-        A None session_id acquires a transient slot without restoring or saving
-        transient state.
+        A None session_id acquires only an empty transient slot without
+        restoring, saving, or evicting persistent session state.
         """
         slots = self._slots.get(model_name)
         if not slots:
@@ -114,6 +114,10 @@ class SlotManager:
 
                 idle_slots = [slot_id for slot_id, info in slots.items() if not info["busy"]]
                 if not idle_slots:
+                    await condition.wait()
+                    continue
+
+                if transient:
                     await condition.wait()
                     continue
 

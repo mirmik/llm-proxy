@@ -41,6 +41,7 @@ _SESSION_HEADER_KEYS = (
     "X-Chat-Id",
 )
 _QWEN_MAIN_PROMPT_DELIMITER = "########"
+_TRANSIENT_SESSION = object()
 
 
 def _setup_app(rm, sm, auth, routes=None):
@@ -94,6 +95,9 @@ def _qwen_prompt_session(prompt_id):
     if not prompt_id:
         return None
 
+    if _qwen_internal_prompt(prompt_id):
+        return _TRANSIENT_SESSION
+
     delimiter_at = prompt_id.find(_QWEN_MAIN_PROMPT_DELIMITER)
     if delimiter_at > 0:
         return prompt_id[:delimiter_at]
@@ -103,6 +107,21 @@ def _qwen_prompt_session(prompt_id):
         return f"{parts[0]}#{parts[1]}"
 
     return None
+
+
+def _qwen_internal_prompt(prompt_id):
+    """Return True for Qwen side queries that should not own persistent KV."""
+    if prompt_id.startswith("side-query:") or prompt_id.startswith("compress-"):
+        return True
+    if "managed-aut" in prompt_id or "managed-auto-memory" in prompt_id:
+        return True
+
+    session_part = prompt_id
+    delimiter_at = session_part.find(_QWEN_MAIN_PROMPT_DELIMITER)
+    if delimiter_at > 0:
+        session_part = session_part[:delimiter_at]
+
+    return session_part.startswith("managed-aut-")
 
 
 def _extract_session_marker(body, headers=None):
@@ -116,6 +135,8 @@ def _extract_session_marker(body, headers=None):
         metadata = body.get("metadata")
         if isinstance(metadata, dict):
             session_id = _qwen_prompt_session(metadata.get("promptId"))
+            if session_id is _TRANSIENT_SESSION:
+                return None, "metadata.promptId:qwen:internal"
             if session_id:
                 return session_id, "metadata.promptId:qwen"
 
@@ -241,7 +262,7 @@ def _resolve_model(rm, model_name, route_manager=None):
 async def _acquire_slot(rm, sm, model_name, session_id, port):
     """Acquire an exclusive slot lease for this local backend request."""
     num_slots = rm.get_slots(model_name)
-    if model_name not in sm._slots:
+    if model_name not in sm._slots or len(sm._slots.get(model_name, {})) != num_slots:
         sm.init_model(model_name, num_slots)
     return await sm.acquire(model_name, session_id, port)
 
