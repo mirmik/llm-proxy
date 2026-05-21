@@ -107,6 +107,10 @@ class AuthManager:
 
     def require_control(self, request):
         """Control endpoints (UI). Open until a web password is set."""
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            identity = self._require_token(request)
+            return f"token:{identity}"
         if not self.web_enabled:
             return "anonymous"
         web_user = self.get_web_user(request)

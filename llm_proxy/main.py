@@ -9,6 +9,7 @@ from aiohttp import web
 
 from llm_proxy.auth import AuthManager
 from llm_proxy.certs import certificate_fingerprint, generate_server_cert, make_ssl_context
+from llm_proxy.cli import configure_subparsers, is_control_command, run_control_command
 from llm_proxy.config import load_config
 from llm_proxy.kv_cache_manager import KVCacheManager
 from llm_proxy.resource_coordinator import ResourceCoordinator
@@ -91,6 +92,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("serve", help="Run the proxy server")
+    configure_subparsers(subparsers)
 
     auth = subparsers.add_parser("auth", help="Manage API tokens")
     auth_subparsers = auth.add_subparsers(dest="auth_command", required=True)
@@ -112,12 +114,15 @@ def main():
 
     args = parser.parse_args()
 
+    config = load_config(args.config)
+
     if args.command in (None, "serve"):
-        config = load_config(args.config)
         asyncio.run(run(config))
         return
 
-    config = load_config(args.config)
+    if is_control_command(args.command):
+        raise SystemExit(asyncio.run(run_control_command(args, config)))
+
     auth_manager = AuthManager(config)
     os.makedirs(auth_manager.state_dir, exist_ok=True)
 
@@ -131,6 +136,10 @@ def main():
         if tls_cfg.get("cert_file") != generated["cert"] or tls_cfg.get("key_file") != generated["key"]:
             print("  Note: update config tls.cert_file/tls.key_file if you want to use these paths.")
         return
+
+    if args.command != "auth":
+        parser.print_help()
+        raise SystemExit(2)
 
     if args.auth_command == "create":
         record = auth_manager.create_token(args.name)
