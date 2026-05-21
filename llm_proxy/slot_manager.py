@@ -5,6 +5,8 @@ import time
 
 import aiohttp
 
+from llm_proxy.oplog import elapsed_ms, log_event, now
+
 
 class SlotManager:
     """Manages slot ↔ session mapping with LRU eviction and KV cache persistence."""
@@ -49,8 +51,10 @@ class SlotManager:
         """
         slots = self._slots.get(model_name)
         if not slots:
+            log_event("slot acquire", model=model_name, session=_session_label(session_id), slot=0, ms=0, reason="untracked")
             return 0
 
+        started = now()
         transient = session_id is None
         condition = self._conditions.setdefault(model_name, asyncio.Condition())
         async with condition:
@@ -65,6 +69,14 @@ class SlotManager:
                             continue
                         info["busy"] = True
                         info["last_used"] = time.time()
+                        log_event(
+                            "slot acquire",
+                            model=model_name,
+                            session=_session_label(session_id),
+                            slot=existing,
+                            ms=elapsed_ms(started),
+                            reason="hit",
+                        )
                         return existing
 
                 # Free idle slot?
@@ -75,6 +87,14 @@ class SlotManager:
                         info["last_used"] = time.time()
                         if not transient:
                             await self._restore(model_name, port, slot_id, session_id)
+                        log_event(
+                            "slot acquire",
+                            model=model_name,
+                            session=_session_label(session_id),
+                            slot=slot_id,
+                            ms=elapsed_ms(started),
+                            reason="free",
+                        )
                         return slot_id
 
                 idle_slots = [slot_id for slot_id, info in slots.items() if not info["busy"]]
@@ -95,6 +115,15 @@ class SlotManager:
                     await self._restore(model_name, port, lru_slot, session_id)
                 info["session"] = session_id
                 info["last_used"] = time.time()
+                log_event(
+                    "slot acquire",
+                    model=model_name,
+                    session=_session_label(session_id),
+                    slot=lru_slot,
+                    evicted=_session_label(old_session),
+                    ms=elapsed_ms(started),
+                    reason="evict",
+                )
                 return lru_slot
 
     async def assign(self, model_name, session_id, port):
@@ -108,9 +137,11 @@ class SlotManager:
             return
         condition = self._conditions.setdefault(model_name, asyncio.Condition())
         async with condition:
+            started = now()
             slots[slot_id]["busy"] = False
             slots[slot_id]["last_used"] = time.time()
             condition.notify_all()
+            log_event("slot release", model=model_name, slot=slot_id, ms=elapsed_ms(started))
 
     async def save_all(self, model_name, port):
         """Save all active slots for a model (before stopping)."""
@@ -121,47 +152,128 @@ class SlotManager:
             return
         condition = self._conditions.setdefault(model_name, asyncio.Condition())
         async with condition:
+            started = now()
             while any(info["busy"] for info in slots.values()):
                 await condition.wait()
+            saved = 0
             for slot_id, info in slots.items():
                 if info["session"]:
                     await self._save(model_name, port, slot_id, info["session"])
+                    saved += 1
+            log_event("slots save-all", model=model_name, count=saved, ms=elapsed_ms(started))
 
     async def _save(self, model_name, port, slot_id, session_id):
         """Save slot KV cache to disk via llama-server API."""
         if model_name in self._no_persistence:
             return
+        started = now()
         url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=save"
         body = {"filename": session_id}
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 200:
-                        print(f"  [Slots] Saved slot {slot_id} → {session_id}")
+                        log_event(
+                            "slot save",
+                            model=model_name,
+                            session=_session_label(session_id),
+                            slot=slot_id,
+                            status=resp.status,
+                            ms=elapsed_ms(started),
+                        )
                     elif resp.status == 400:
                         self._no_persistence.add(model_name)
-                        print(f"  [Slots] Save not supported for {model_name}, disabling persistence")
+                        log_event(
+                            "slot save disabled",
+                            model=model_name,
+                            session=_session_label(session_id),
+                            slot=slot_id,
+                            status=resp.status,
+                            ms=elapsed_ms(started),
+                        )
                     else:
                         text = await resp.text()
-                        print(f"  [Slots] Save failed slot {slot_id}: {resp.status} {text}")
+                        log_event(
+                            "slot save failed",
+                            model=model_name,
+                            session=_session_label(session_id),
+                            slot=slot_id,
+                            status=resp.status,
+                            ms=elapsed_ms(started),
+                            error=_short_error(text),
+                        )
         except Exception as e:
-            print(f"  [Slots] Save error slot {slot_id}: {e}")
+            log_event(
+                "slot save error",
+                model=model_name,
+                session=_session_label(session_id),
+                slot=slot_id,
+                ms=elapsed_ms(started),
+                error=e,
+            )
 
     async def _restore(self, model_name, port, slot_id, session_id):
         """Restore slot KV cache from disk. Silently skips if unsupported or no saved state."""
         if model_name in self._no_persistence:
             return
+        started = now()
         url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=restore"
         body = {"filename": session_id}
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 200:
-                        print(f"  [Slots] Restored slot {slot_id} ← {session_id}")
+                        log_event(
+                            "slot restore",
+                            model=model_name,
+                            session=_session_label(session_id),
+                            slot=slot_id,
+                            status=resp.status,
+                            ms=elapsed_ms(started),
+                        )
                     elif resp.status == 400:
-                        pass  # No saved state or not supported
+                        log_event(
+                            "slot restore skipped",
+                            model=model_name,
+                            session=_session_label(session_id),
+                            slot=slot_id,
+                            status=resp.status,
+                            ms=elapsed_ms(started),
+                            reason="missing-or-unsupported",
+                        )
                     else:
                         text = await resp.text()
-                        print(f"  [Slots] Restore failed slot {slot_id}: {resp.status} {text}")
+                        log_event(
+                            "slot restore failed",
+                            model=model_name,
+                            session=_session_label(session_id),
+                            slot=slot_id,
+                            status=resp.status,
+                            ms=elapsed_ms(started),
+                            error=_short_error(text),
+                        )
         except Exception as e:
-            print(f"  [Slots] Restore error slot {slot_id}: {e}")
+            log_event(
+                "slot restore error",
+                model=model_name,
+                session=_session_label(session_id),
+                slot=slot_id,
+                ms=elapsed_ms(started),
+                error=e,
+            )
+
+
+def _session_label(session_id):
+    if session_id is None:
+        return "transient"
+    text = str(session_id)
+    if len(text) <= 16:
+        return text
+    return f"{text[:8]}..{text[-4:]}"
+
+
+def _short_error(text, limit=120):
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."

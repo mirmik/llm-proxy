@@ -10,6 +10,8 @@ from collections import deque
 
 import aiohttp
 
+from llm_proxy.oplog import elapsed_ms, log_event, now
+
 
 _VALID_NAME = re.compile(r"^(?!\.)[a-zA-Z0-9_.\-]+$")
 
@@ -127,14 +129,16 @@ class RuntimeManager:
                     await self.start(name)
                 except Exception as e:
                     self._append_log(name, f"[WARN] Autostart failed: {e}")
-                    print(f"  [WARN] Failed to autoload runtime {name}: {e}")
+                    log_event("runtime autostart failed", runtime=name, error=e)
 
     async def start(self, runtime_name):
         if self.is_running(runtime_name):
+            log_event("runtime start skipped", runtime=runtime_name, reason="already-running")
             return
         if runtime_name not in self.runtimes:
             raise ValueError(f"Unknown runtime: {runtime_name}")
 
+        started = now()
         runtime = self.runtimes[runtime_name]
         driver = self.driver_for(runtime_name)
         profile = self.resolve_profile(runtime_name)
@@ -145,6 +149,13 @@ class RuntimeManager:
         env.update(driver.build_env(runtime_name, profile, self.config))
         self._logs.setdefault(runtime_name, deque(maxlen=200))
         self._append_log(runtime_name, f"$ {' '.join(argv)}")
+        log_event(
+            "runtime start",
+            runtime=runtime_name,
+            driver=runtime["driver"],
+            profile=self.current_profile(runtime_name),
+            port=profile.get("port"),
+        )
         proc = await asyncio.create_subprocess_exec(
             *argv,
             env=env,
@@ -162,20 +173,24 @@ class RuntimeManager:
                 await self.stop(runtime_name)
                 raise TimeoutError(f"{runtime_name} failed to start within {timeout}s")
         self._append_log(runtime_name, "[ready]")
+        log_event("runtime ready", runtime=runtime_name, ms=elapsed_ms(started), pid=proc.pid)
 
     async def stop(self, runtime_name):
         proc = self._processes.get(runtime_name)
         if proc is None or proc.returncode is not None:
             self._processes.pop(runtime_name, None)
             self._meta.pop(runtime_name, None)
+            log_event("runtime stop skipped", runtime=runtime_name, reason="not-running")
             return
 
+        started = now()
         driver = self.driver_for(runtime_name)
         profile = self.resolve_profile(runtime_name)
         stop_signal = str(driver.stop_signal(runtime_name, profile)).upper()
         sig = getattr(signal, stop_signal, signal.SIGTERM)
 
         self._append_log(runtime_name, f"[stopping] signal={stop_signal}")
+        log_event("runtime stop", runtime=runtime_name, signal=stop_signal, pid=proc.pid)
         proc.send_signal(sig)
         try:
             await asyncio.wait_for(proc.wait(), timeout=10)
@@ -186,6 +201,7 @@ class RuntimeManager:
         self._processes.pop(runtime_name, None)
         self._meta.pop(runtime_name, None)
         self._append_log(runtime_name, "[stopped]")
+        log_event("runtime stopped", runtime=runtime_name, ms=elapsed_ms(started), code=proc.returncode)
 
     async def stop_all(self):
         for name in list(self._processes):
@@ -416,7 +432,6 @@ class RuntimeManager:
 
     def _append_log(self, runtime_name, line):
         self._logs.setdefault(runtime_name, deque(maxlen=200)).append(line)
-        print(f"  [rt:{runtime_name}] {line}")
 
     async def _wait_healthy(self, url, timeout=120):
         deadline = asyncio.get_event_loop().time() + timeout
@@ -440,6 +455,7 @@ class RuntimeManager:
             self._append_log(runtime_name, text)
         if proc.returncode not in (None, 0):
             self._append_log(runtime_name, f"[exit] code={proc.returncode}")
+            log_event("runtime exited", runtime=runtime_name, code=proc.returncode)
 
 
 def _parse_env(value):

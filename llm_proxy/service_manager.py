@@ -9,6 +9,8 @@ from collections import deque
 
 import aiohttp
 
+from llm_proxy.oplog import elapsed_ms, log_event, now
+
 
 class ServiceManager:
     """Manages command-based local services with profile switching."""
@@ -85,14 +87,16 @@ class ServiceManager:
                     await self.start(name)
                 except Exception as e:
                     self._append_log(name, f"[WARN] Autostart failed: {e}")
-                    print(f"  [WARN] Failed to autostart service {name}: {e}")
+                    log_event("service autostart failed", service=name, error=e)
 
     async def start(self, service_name):
         if self.is_running(service_name):
+            log_event("service start skipped", service=service_name, reason="already-running")
             return
         if service_name not in self.services:
             raise ValueError(f"Unknown service: {service_name}")
 
+        started = now()
         effective = self._resolve(service_name)
         command = effective.get("command")
         if not command:
@@ -110,6 +114,12 @@ class ServiceManager:
         os.makedirs(workdir, exist_ok=True)
         self._logs.setdefault(service_name, deque(maxlen=200))
         self._append_log(service_name, f"$ {' '.join(argv)}")
+        log_event(
+            "service start",
+            service=service_name,
+            port=effective.get("port"),
+            workdir=workdir,
+        )
         proc = await asyncio.create_subprocess_exec(
             *argv,
             cwd=workdir,
@@ -127,19 +137,23 @@ class ServiceManager:
             raise TimeoutError(f"{service_name} failed to start within {timeout}s")
 
         self._append_log(service_name, "[ready]")
+        log_event("service ready", service=service_name, ms=elapsed_ms(started), pid=proc.pid)
 
     async def stop(self, service_name):
         proc = self._processes.get(service_name)
         if proc is None or proc.returncode is not None:
             self._processes.pop(service_name, None)
+            log_event("service stop skipped", service=service_name, reason="not-running")
             return
 
+        started = now()
         effective = self._resolve(service_name)
         stop_signal = str(effective.get("stop_signal", "SIGTERM")).upper()
         sig = getattr(signal, stop_signal, signal.SIGTERM)
         timeout = float(effective.get("stop_timeout", 10))
 
         self._append_log(service_name, f"[stopping] signal={stop_signal}")
+        log_event("service stop", service=service_name, signal=stop_signal, pid=proc.pid)
         proc.send_signal(sig)
         try:
             await asyncio.wait_for(proc.wait(), timeout=timeout)
@@ -149,6 +163,7 @@ class ServiceManager:
             await proc.wait()
         self._processes.pop(service_name, None)
         self._append_log(service_name, "[stopped]")
+        log_event("service stopped", service=service_name, ms=elapsed_ms(started), code=proc.returncode)
 
     async def restart(self, service_name):
         await self.stop(service_name)
@@ -197,7 +212,6 @@ class ServiceManager:
 
     def _append_log(self, service_name, line):
         self._logs.setdefault(service_name, deque(maxlen=200)).append(line)
-        print(f"  [svc:{service_name}] {line}")
 
     def _command_argv(self, command):
         if isinstance(command, str):

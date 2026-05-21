@@ -1,5 +1,7 @@
 """Shared GPU/resource conflict coordinator."""
 
+from llm_proxy.oplog import log_event
+
 
 class ResourceCoordinator:
     """Stops conflicting managed items before a new one starts."""
@@ -20,5 +22,10 @@ class ResourceCoordinator:
             for other_name in handler["list"](gpu):
                 if other_kind == kind and other_name == name:
                     continue
-                print(f"  [RC] Stopping {other_kind}:{other_name} (GPU conflict: {gpu})")
+                log_event(
+                    "resource conflict stop",
+                    requested=f"{kind}:{name}",
+                    stopped=f"{other_kind}:{other_name}",
+                    gpu=gpu,
+                )
                 await handler["stop"](other_name)
