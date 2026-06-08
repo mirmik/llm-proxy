@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import re
 import time
+from pathlib import Path
 
 import aiohttp
 
@@ -13,15 +14,17 @@ from llm_proxy.oplog import elapsed_ms, log_event, now
 class SlotManager:
     """Manages slot ↔ session mapping with LRU eviction and KV cache persistence."""
 
-    def __init__(self):
+    def __init__(self, cache_dir=None):
         # model_name → {slot_id: {"session": str|None, "last_used": float, "busy": bool}}
         self._slots = {}
         self._conditions = {}
         # Models where save/restore is known to be unsupported
         self._no_persistence = set()
+        self.cache_dir = Path(cache_dir).expanduser() if cache_dir else None
 
     def init_model(self, model_name, num_slots):
         """Register slots for a newly started model."""
+        self._ensure_runtime_cache_dir(model_name)
         self._slots[model_name] = {
             i: {"session": None, "last_used": 0, "busy": False}
             for i in range(num_slots)
@@ -54,6 +57,10 @@ class SlotManager:
             if sessions:
                 active[model_name] = sessions
         return active
+
+    def active_models(self):
+        """Return model names with registered slots."""
+        return set(self._slots)
 
     async def acquire(self, model_name, session_id, port):
         """Acquire an exclusive slot lease for a session. Returns slot_id.
@@ -186,6 +193,7 @@ class SlotManager:
         """Save slot KV cache to disk via llama-server API."""
         if model_name in self._no_persistence:
             return
+        self._ensure_runtime_cache_dir(model_name)
         started = now()
         url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=save"
         filename = _cache_filename(session_id)
@@ -245,6 +253,7 @@ class SlotManager:
         """Restore slot KV cache from disk. Silently skips if unsupported or no saved state."""
         if model_name in self._no_persistence:
             return
+        self._ensure_runtime_cache_dir(model_name)
         started = now()
         url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=restore"
         filename = _cache_filename(session_id)
@@ -297,6 +306,20 @@ class SlotManager:
                 file=filename,
                 error=e,
             )
+
+    def _ensure_runtime_cache_dir(self, model_name):
+        if self.cache_dir is None:
+            return
+        path = self.cache_dir / str(model_name)
+        try:
+            root = self.cache_dir.resolve()
+            resolved = path.resolve()
+            resolved.relative_to(root)
+            resolved.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log_event("slot cache dir ensure failed", model=model_name, path=path, error=exc)
+        except ValueError:
+            log_event("slot cache dir rejected", model=model_name, path=path)
 
 
 def _session_label(session_id):

@@ -78,7 +78,8 @@ class KVCacheManager:
             files, trimmed = self._enforce_total(files)
             result += trimmed
 
-        self._remove_empty_dirs()
+        active_models = set(self.slot_manager.active_models()) if hasattr(self.slot_manager, "active_models") else set()
+        self._remove_empty_dirs(active_models)
         log_event(
             "kv cleanup",
             reason=reason,
@@ -166,14 +167,17 @@ class KVCacheManager:
             log_event("kv cleanup deleted", reason=reason, count=result.deleted, bytes=result.bytes_deleted)
         return result
 
-    def _remove_empty_dirs(self):
+    def _remove_empty_dirs(self, keep_runtimes=None):
         root = _safe_resolve(self.cache_dir)
         if root is None or not root.is_dir():
             return
+        keep_runtimes = {str(name) for name in (keep_runtimes or set())}
         dirs = [path for path in root.rglob("*") if path.is_dir()]
         for path in sorted(dirs, key=lambda p: len(p.parts), reverse=True):
             resolved = _safe_resolve(path)
             if resolved is None or not _is_within(resolved, root):
+                continue
+            if _runtime_dir_name(root, resolved) in keep_runtimes:
                 continue
             try:
                 path.rmdir()
@@ -221,6 +225,16 @@ def _runtime_name(root, path):
     except ValueError:
         return "_root"
     return relative.parts[0] if len(relative.parts) > 1 else "_root"
+
+
+def _runtime_dir_name(root, path):
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return None
+    if len(relative.parts) == 1:
+        return relative.parts[0]
+    return None
 
 
 def _optional_float(value):

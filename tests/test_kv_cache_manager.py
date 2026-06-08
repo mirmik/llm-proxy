@@ -51,8 +51,7 @@ class KVCacheManagerTests(unittest.IsolatedAsyncioTestCase):
 
             sm = SlotManager()
             sm.init_model("model", 1)
-            slot = await sm.acquire("model", "active-session", 8081)
-            await sm.release("model", slot)
+            sm._slots["model"][0]["session"] = "active-session"
 
             manager = KVCacheManager(
                 {
@@ -70,6 +69,31 @@ class KVCacheManagerTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(result.deleted, 0)
             self.assertTrue(active_file.exists())
+
+    async def test_cleanup_keeps_empty_registered_runtime_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp)
+            runtime_dir = cache_dir / "model"
+            runtime_dir.mkdir(parents=True)
+
+            sm = SlotManager()
+            sm.init_model("model", 1)
+
+            manager = KVCacheManager(
+                {
+                    "cache_dir": str(cache_dir),
+                    "kv_cache": {
+                        "cleanup_enabled": True,
+                        "ttl_hours": None,
+                    },
+                },
+                sm,
+            )
+
+            result = await manager.cleanup_once()
+
+            self.assertEqual(result.deleted, 0)
+            self.assertTrue(runtime_dir.exists())
 
     async def test_per_runtime_size_limit_deletes_oldest_first(self):
         with tempfile.TemporaryDirectory() as tmp:

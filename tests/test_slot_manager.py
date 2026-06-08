@@ -1,5 +1,8 @@
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from llm_proxy.slot_manager import SlotManager, _cache_filename
 
@@ -144,6 +147,41 @@ class SlotManagerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/", filename)
         self.assertNotIn("\\", filename)
         self.assertIn("-", filename)
+
+    async def test_save_recreates_runtime_cache_dir_before_backend_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp)
+            runtime_dir = cache_dir / "model"
+            sm = SlotManager(cache_dir=cache_dir)
+
+            with patch("llm_proxy.slot_manager.aiohttp.ClientSession", _DummyClientSession):
+                await sm._save("model", 1, 0, "session-a")
+
+            self.assertTrue(runtime_dir.exists())
+
+
+class _DummyClientSession:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    def post(self, *args, **kwargs):
+        return _DummyResponse()
+
+
+class _DummyResponse:
+    status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def text(self):
+        return ""
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from llm_proxy.router import create_api_app, create_control_app
 async def run(config):
     coordinator = ResourceCoordinator()
     rm = RuntimeManager(config, coordinator=coordinator)
-    sm = SlotManager()
+    sm = SlotManager(cache_dir=config.get("cache_dir", "~/.cache/llm-proxy"))
     auth = AuthManager(config)
     routes = RouteManager(config)
     kv_cache = KVCacheManager(config, sm)
