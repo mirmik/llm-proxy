@@ -396,6 +396,8 @@
         <div class="field"><label>Health timeout (s)</label><input id="nrt-health-timeout" value="2.0"></div>
         <div class="field"><label>Check interval (s)</label><input id="nrt-check-interval" value="5.0"></div>
         <div class="field"><label>Session TTL (s)</label><input id="nrt-session-ttl" value="14400"></div>
+        <div class="field"><label>Sticky rebalance</label><select id="nrt-sticky-rebalance"><option value="false">false</option><option value="true">true</option></select></div>
+        <div class="field"><label>Rebalance cooldown (s)</label><input id="nrt-rebalance-cooldown" value="30"></div>
       </div>
       <div class="actions">
         <button class="btn" id="newRouteCreate">Create route</button>
@@ -869,6 +871,8 @@
         <td><input class="rb-model" value="${escapeHtml(b.model || route.name)}"></td>
         <td><input class="rb-auth" value="${escapeHtml(b.auth || "")}" placeholder="—"></td>
         <td><input class="rb-weight" value="${escapeHtml(String(b.weight || 1))}"></td>
+        <td><input class="rb-capacity" value="${escapeHtml(String(b.capacity || 1))}"></td>
+        <td style="text-align:center;"><input type="checkbox" class="rb-overflow-only" ${b.overflow_only ? "checked" : ""}></td>
         <td style="text-align:center;"><input type="checkbox" class="rb-tls-verify" ${b.tls_verify === false ? "" : "checked"}></td>
         <td>${healthDot(b.healthy)}</td>
         <td>${b.latency_ms != null ? b.latency_ms + " ms" : "—"}</td>
@@ -891,25 +895,29 @@
       <div style="margin-bottom:8px;font-size:0.82rem;color:var(--text-muted);">
         Active: <code>${escapeHtml(route.active_url || "—")}</code> · Sticky sessions: ${escapeHtml(String(route.sticky_sessions || 0))}
       </div>
-      <div class="route-settings" data-route="${escapeHtml(route.name)}" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:12px;">
+      <div class="route-settings" data-route="${escapeHtml(route.name)}" style="display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:12px;">
         <div class="field"><label>Health path</label><input class="rs-health-path" value="${escapeHtml(route.health_path || "/health")}"></div>
         <div class="field"><label>Health timeout (s)</label><input class="rs-health-timeout" value="${escapeHtml(String(route.health_timeout || 2.0))}"></div>
         <div class="field"><label>Check interval (s)</label><input class="rs-check-interval" value="${escapeHtml(String(route.check_interval || 5.0))}"></div>
         <div class="field"><label>Session TTL (s)</label><input class="rs-session-ttl" value="${escapeHtml(String(route.session_ttl || 3600))}"></div>
+        <div class="field"><label>Sticky rebalance</label><select class="rs-sticky-rebalance"><option value="true" ${route.sticky_rebalance ? "selected" : ""}>true</option><option value="false" ${route.sticky_rebalance ? "" : "selected"}>false</option></select></div>
+        <div class="field"><label>Rebalance cooldown (s)</label><input class="rs-rebalance-cooldown" value="${escapeHtml(String(route.rebalance_cooldown || 30))}"></div>
         <div class="actions" style="grid-column:1/-1;margin:0;">
           <button class="secondary" data-route-action="save-route-settings" data-route="${escapeHtml(route.name)}">Save route settings</button>
         </div>
       </div>
       <table>
-        <thead><tr><th>#</th><th>URL</th><th>Model</th><th>Auth</th><th>Weight</th><th>TLS verify</th><th>OK?</th><th>Latency</th><th>Inflight</th><th></th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="10" class="empty">No backends configured.</td></tr>'}</tbody>
+        <thead><tr><th>#</th><th>URL</th><th>Model</th><th>Auth</th><th>Weight</th><th>Capacity</th><th>Overflow</th><th>TLS verify</th><th>OK?</th><th>Latency</th><th>Inflight</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="12" class="empty">No backends configured.</td></tr>'}</tbody>
       </table>
       <div class="add-backend-form" data-route="${escapeHtml(route.name)}" hidden style="margin-top:12px;padding:12px;border:1px solid var(--border-soft);border-radius:8px;">
-        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;">
+        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;">
           <div class="field" style="grid-column:1/-1;"><label>URL *</label><input class="ab-url" placeholder="http://192.168.1.100:8080"></div>
           <div class="field"><label>Model override</label><input class="ab-model" placeholder="${escapeHtml(route.name)}"></div>
           <div class="field"><label>Auth host name</label><input class="ab-auth" placeholder="remote-cluster"></div>
           <div class="field"><label>Weight</label><input class="ab-weight" value="1"></div>
+          <div class="field"><label>Capacity</label><input class="ab-capacity" value="1"></div>
+          <div class="field"><label>Overflow only</label><select class="ab-overflow-only"><option value="false">false</option><option value="true">true</option></select></div>
           <div class="field"><label>TLS verify</label><select class="ab-tls-verify"><option value="true">true</option><option value="false">false</option></select></div>
         </div>
         <div class="actions">
@@ -955,6 +963,8 @@
         health_timeout: parseFloat(form.querySelector(".rs-health-timeout").value) || 2.0,
         check_interval: parseFloat(form.querySelector(".rs-check-interval").value) || 5.0,
         session_ttl: parseFloat(form.querySelector(".rs-session-ttl").value) || 3600,
+        sticky_rebalance: form.querySelector(".rs-sticky-rebalance").value === "true",
+        rebalance_cooldown: parseFloat(form.querySelector(".rs-rebalance-cooldown").value) || 30,
       };
       try {
         await api(`/v1/control/routes/${encodeURIComponent(routeName)}/settings`, {method: "POST", body: JSON.stringify(body)});
@@ -972,6 +982,8 @@
         model: row.querySelector(".rb-model").value.trim(),
         auth: row.querySelector(".rb-auth").value.trim(),
         weight: parseFloat(row.querySelector(".rb-weight").value) || 1,
+        capacity: parseInt(row.querySelector(".rb-capacity").value, 10) || 1,
+        overflow_only: row.querySelector(".rb-overflow-only").checked,
         tls_verify: row.querySelector(".rb-tls-verify").checked,
       };
       try {
@@ -1000,9 +1012,11 @@
       const model = form.querySelector(".ab-model").value.trim();
       const auth = form.querySelector(".ab-auth").value.trim();
       const weight = parseFloat(form.querySelector(".ab-weight").value) || 1;
+      const capacity = parseInt(form.querySelector(".ab-capacity").value, 10) || 1;
+      const overflowOnly = form.querySelector(".ab-overflow-only").value === "true";
       const tlsVerify = form.querySelector(".ab-tls-verify").value !== "false";
       if (!url) { setMsg(document.getElementById(`routeMsg-${routeName}`), "URL is required.", "error"); return; }
-      const body = {url, weight, tls_verify: tlsVerify};
+      const body = {url, weight, capacity, overflow_only: overflowOnly, tls_verify: tlsVerify};
       if (model) body.model = model;
       if (auth) body.auth = auth;
       try {
@@ -1035,6 +1049,8 @@
       health_timeout: parseFloat(document.getElementById("nrt-health-timeout").value) || 2.0,
       check_interval: parseFloat(document.getElementById("nrt-check-interval").value) || 5.0,
       session_ttl: parseFloat(document.getElementById("nrt-session-ttl").value) || 14400,
+      sticky_rebalance: document.getElementById("nrt-sticky-rebalance").value === "true",
+      rebalance_cooldown: parseFloat(document.getElementById("nrt-rebalance-cooldown").value) || 30,
       backends: [],
     };
     try {

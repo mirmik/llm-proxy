@@ -53,7 +53,8 @@ class Route:
 
     def __init__(self, name, backends, kind="llm", health_path="/health",
                  health_timeout=2.0, check_interval=5.0, hosts=None,
-                 session_ttl=3600.0):
+                 session_ttl=3600.0, sticky_rebalance=False,
+                 rebalance_cooldown=30.0):
         self.name = name
         self.kind = kind
         self.backends = list(backends)
@@ -61,6 +62,8 @@ class Route:
         self.health_timeout = health_timeout
         self.check_interval = check_interval
         self.session_ttl = float(session_ttl)
+        self.sticky_rebalance = bool(sticky_rebalance)
+        self.rebalance_cooldown = float(rebalance_cooldown)
         self.hosts = hosts or {}
         self._by_url = {}
         self._healthy = {}
@@ -69,6 +72,7 @@ class Route:
         self._inflight = {}
         self._session_backend = {}
         self._session_seen = {}
+        self._session_migrated = {}
         self._active_url = backends[0]["url"] if backends else None
         self._lock = asyncio.Lock()
 
@@ -158,17 +162,18 @@ class Route:
         self._prune_sessions()
         sticky_url = self._session_backend.get(session_id) if session_id else None
         if sticky_url and self._healthy.get(sticky_url) is not False and sticky_url in self._by_url:
-            ordered_urls = [sticky_url]
-            reason = "sticky"
+            rebalance_url = self._rebalance_target(session_id, sticky_url)
+            if rebalance_url:
+                ordered_urls = [rebalance_url, sticky_url]
+                reason = "rebalance"
+            else:
+                ordered_urls = [sticky_url]
+                reason = "sticky"
         else:
             ordered_urls = []
             reason = "least-loaded" if session_id else "least-loaded-no-session"
 
-        remaining = [
-            b["url"] for b in self.backends
-            if b["url"] not in ordered_urls
-        ]
-        remaining.sort(key=self._candidate_score)
+        remaining = self._ordered_urls(exclude=set(ordered_urls))
         ordered_urls.extend(remaining)
 
         out = []
@@ -182,6 +187,9 @@ class Route:
     def note_request_start(self, session_id, url):
         self._inflight[url] = self._inflight.get(url, 0) + 1
         if session_id:
+            previous = self._session_backend.get(session_id)
+            if previous and previous != url:
+                self._session_migrated[session_id] = time.time()
             self._session_backend[session_id] = url
             self._session_seen[session_id] = time.time()
 
@@ -190,21 +198,79 @@ class Route:
         if session_id and self._session_backend.get(session_id) == url:
             self._session_seen[session_id] = time.time()
 
-    def _candidate_score(self, url):
+    def _ordered_urls(self, exclude=None):
+        exclude = exclude or set()
+        urls = [b["url"] for b in self.backends if b["url"] not in exclude]
+        non_overflow_available = any(
+            not self._is_overflow_only(url) and self._has_capacity(url)
+            for url in urls
+            if self._healthy.get(url) is not False
+        )
+        urls.sort(key=lambda url: self._candidate_score(url, non_overflow_available))
+        return urls
+
+    def _candidate_score(self, url, non_overflow_available=False):
         healthy_penalty = 0 if self._healthy.get(url) is not False else 1
         backend = self._by_url.get(url) or {}
         weight = max(float(backend.get("weight", 1) or 1), 0.001)
         load = self._inflight.get(url, 0) / weight
+        saturated_penalty = 0 if self._has_capacity(url) else 1
+        overflow_penalty = 1 if non_overflow_available and self._is_overflow_only(url) else 0
         latency = self._latency.get(url)
         latency_score = latency if latency is not None else 0.0
         priority = self._backend_index(url)
-        return (healthy_penalty, load, latency_score, priority)
+        return (healthy_penalty, saturated_penalty, overflow_penalty, load, latency_score, priority)
+
+    def _rebalance_target(self, session_id, sticky_url):
+        if not self.sticky_rebalance or not session_id:
+            return None
+        migrated_at = self._session_migrated.get(session_id)
+        if migrated_at and time.time() - migrated_at < self.rebalance_cooldown:
+            return None
+        alternatives = self._ordered_urls(exclude={sticky_url})
+        if not alternatives:
+            return None
+        target = alternatives[0]
+        if self._healthy.get(target) is False or not self._has_capacity(target):
+            return None
+        if self._should_preempt_sticky(sticky_url, target):
+            return target
+        return None
+
+    def _should_preempt_sticky(self, sticky_url, target_url):
+        sticky = self._by_url.get(sticky_url) or {}
+        target = self._by_url.get(target_url) or {}
+        if self._is_overflow_only(sticky_url) and not self._is_overflow_only(target_url):
+            return True
+        if self._inflight.get(sticky_url, 0) >= self._backend_capacity(sticky_url):
+            return True
+        sticky_priority = self._backend_index(sticky_url)
+        target_priority = self._backend_index(target_url)
+        target_weight = float(target.get("weight", 1) or 1)
+        sticky_weight = float(sticky.get("weight", 1) or 1)
+        return target_priority < sticky_priority and target_weight > sticky_weight
 
     def _backend_index(self, url):
         for index, backend in enumerate(self.backends):
             if backend["url"] == url:
                 return index
         return len(self.backends)
+
+    def _backend_capacity(self, url):
+        backend = self._by_url.get(url) or {}
+        value = backend.get("capacity", 1)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = 1
+        return max(parsed, 1)
+
+    def _has_capacity(self, url):
+        return self._inflight.get(url, 0) < self._backend_capacity(url)
+
+    def _is_overflow_only(self, url):
+        backend = self._by_url.get(url) or {}
+        return bool(backend.get("overflow_only", False))
 
     def _prune_sessions(self):
         if not self._session_seen or self.session_ttl <= 0:
@@ -214,6 +280,7 @@ class Route:
         for sid in expired:
             self._session_seen.pop(sid, None)
             self._session_backend.pop(sid, None)
+            self._session_migrated.pop(sid, None)
 
     def _drop_sessions_for_url_locked(self, url):
         stale = [sid for sid, bound in self._session_backend.items() if bound == url]
@@ -251,6 +318,8 @@ class Route:
                 "last_checked": self._last_checked.get(u),
                 "inflight": self._inflight.get(u, 0),
                 "weight": b.get("weight", 1),
+                "capacity": self._backend_capacity(u),
+                "overflow_only": bool(b.get("overflow_only", False)),
             })
         return {
             "name": self.name,
@@ -260,6 +329,8 @@ class Route:
             "health_timeout": self.health_timeout,
             "check_interval": self.check_interval,
             "session_ttl": self.session_ttl,
+            "sticky_rebalance": self.sticky_rebalance,
+            "rebalance_cooldown": self.rebalance_cooldown,
             "sticky_sessions": len(self._session_backend),
             "backends": backends_status,
         }
@@ -294,6 +365,8 @@ class Route:
             "health_timeout": self.health_timeout,
             "check_interval": self.check_interval,
             "session_ttl": self.session_ttl,
+            "sticky_rebalance": self.sticky_rebalance,
+            "rebalance_cooldown": self.rebalance_cooldown,
             "backends": [
                 {k: v for k, v in b.items() if not k.startswith("_")}
                 for b in self.backends
@@ -325,6 +398,8 @@ class RouteManager:
                 health_timeout=spec.get("health_timeout", 2.0),
                 check_interval=spec.get("check_interval", 5.0),
                 session_ttl=spec.get("session_ttl", 3600.0),
+                sticky_rebalance=spec.get("sticky_rebalance", False),
+                rebalance_cooldown=spec.get("rebalance_cooldown", 30.0),
                 hosts=hosts,
             )
             self._routes[name] = route
@@ -535,6 +610,10 @@ def _upsert_route(data, name, spec):
         entry["check_interval"] = spec["check_interval"]
     if "session_ttl" in spec:
         entry["session_ttl"] = spec["session_ttl"]
+    if "sticky_rebalance" in spec:
+        entry["sticky_rebalance"] = bool(spec["sticky_rebalance"])
+    if "rebalance_cooldown" in spec:
+        entry["rebalance_cooldown"] = float(spec["rebalance_cooldown"])
     routes[name] = entry
 
 
@@ -570,7 +649,14 @@ def _update_route_settings(data, route_name, settings):
     if not route:
         raise ValueError(f"Unknown route: {route_name}")
 
-    for key in ("health_path", "health_timeout", "check_interval", "session_ttl"):
+    for key in (
+        "health_path",
+        "health_timeout",
+        "check_interval",
+        "session_ttl",
+        "sticky_rebalance",
+        "rebalance_cooldown",
+    ):
         if key not in settings:
             continue
         value = settings[key]
@@ -578,6 +664,8 @@ def _update_route_settings(data, route_name, settings):
             continue
         if key == "health_path":
             route[key] = str(value)
+        elif key == "sticky_rebalance":
+            route[key] = bool(value)
         else:
             route[key] = float(value)
 
@@ -592,7 +680,7 @@ def _update_backend(data, route_name, index, backend_spec):
         raise ValueError(f"Invalid backend index: {index}")
 
     current = dict(backends[index])
-    for key in ("url", "model", "auth", "weight", "tls_verify"):
+    for key in ("url", "model", "auth", "weight", "capacity", "overflow_only", "tls_verify"):
         if key not in backend_spec:
             continue
         value = backend_spec[key]
@@ -600,6 +688,10 @@ def _update_backend(data, route_name, index, backend_spec):
             current.pop(key, None)
         elif key == "weight":
             current[key] = float(value)
+        elif key == "capacity":
+            current[key] = max(int(value), 1)
+        elif key == "overflow_only":
+            current[key] = bool(value)
         elif key == "tls_verify":
             current[key] = bool(value)
         else:

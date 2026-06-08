@@ -78,6 +78,71 @@ class RouteSessionDispatchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(candidate["url"], "http://large:8090")
 
+    def test_overflow_backend_waits_until_primary_capacity_is_full(self):
+        route = Route(
+            "model",
+            [
+                {"url": "http://fast:8090", "capacity": 2},
+                {"url": "http://slow:8090", "capacity": 1, "overflow_only": True},
+            ],
+        )
+        route.note_request_start("a", "http://fast:8090")
+
+        candidate = route.failover_candidates(session_id="b")[0]
+
+        self.assertEqual(candidate["url"], "http://fast:8090")
+
+    def test_overflow_backend_is_used_when_primary_capacity_is_full(self):
+        route = Route(
+            "model",
+            [
+                {"url": "http://fast:8090", "capacity": 2},
+                {"url": "http://slow:8090", "capacity": 1, "overflow_only": True},
+            ],
+        )
+        route.note_request_start("a", "http://fast:8090")
+        route.note_request_start("b", "http://fast:8090")
+
+        candidate = route.failover_candidates(session_id="c")[0]
+
+        self.assertEqual(candidate["url"], "http://slow:8090")
+
+    def test_sticky_overflow_session_rebalances_to_free_primary(self):
+        route = Route(
+            "model",
+            [
+                {"url": "http://fast:8090", "weight": 4, "capacity": 2},
+                {"url": "http://slow:8090", "weight": 1, "capacity": 1, "overflow_only": True},
+            ],
+            sticky_rebalance=True,
+        )
+        route.note_request_start("session-a", "http://slow:8090")
+        route.note_request_end("session-a", "http://slow:8090")
+
+        candidate = route.failover_candidates(session_id="session-a")[0]
+
+        self.assertEqual(candidate["url"], "http://fast:8090")
+        self.assertEqual(candidate["_route_reason"], "rebalance")
+
+    def test_recently_migrated_session_respects_rebalance_cooldown(self):
+        route = Route(
+            "model",
+            [
+                {"url": "http://fast:8090", "weight": 4, "capacity": 2},
+                {"url": "http://slow:8090", "weight": 1, "capacity": 1, "overflow_only": True},
+            ],
+            sticky_rebalance=True,
+            rebalance_cooldown=60,
+        )
+        route.note_request_start("session-a", "http://slow:8090")
+        route.note_request_end("session-a", "http://slow:8090")
+        route._session_migrated["session-a"] = 9999999999
+
+        candidate = route.failover_candidates(session_id="session-a")[0]
+
+        self.assertEqual(candidate["url"], "http://slow:8090")
+        self.assertEqual(candidate["_route_reason"], "sticky")
+
 
 if __name__ == "__main__":
     unittest.main()
