@@ -42,6 +42,7 @@ _SESSION_HEADER_KEYS = (
 )
 _QWEN_MAIN_PROMPT_DELIMITER = "########"
 _TRANSIENT_SESSION = object()
+_STT_RUNTIME_HEADER = "X-STT-Runtime"
 
 
 def _setup_app(rm, sm, auth, routes=None):
@@ -647,9 +648,19 @@ async def handle_health(request):
     })
 
 
-def _resolve_stt_runtime(rm):
+def _resolve_stt_runtime(rm, requested=None):
     preferred = "stt-main"
     stt_runtimes = rm.runtimes_by_kind("stt")
+    if requested:
+        if requested in stt_runtimes:
+            return requested, None
+        return None, web.json_response(
+            {
+                "error": f"Unknown STT runtime '{requested}'",
+                "available": stt_runtimes,
+            },
+            status=404,
+        )
     if preferred in stt_runtimes:
         return preferred, None
     if len(stt_runtimes) == 1:
@@ -669,9 +680,10 @@ async def handle_stt_proxy(request):
     rm = request.app["rm"]
     route_manager = request.app.get("routes")
     host = _client_host(request)
-    log_event("request received", kind="stt", host=host)
+    requested_runtime = request.headers.get(_STT_RUNTIME_HEADER, "").strip() or None
+    log_event("request received", kind="stt", host=host, runtime=requested_runtime)
 
-    if route_manager:
+    if route_manager and not requested_runtime:
         stt_routes = [n for n in route_manager.available_routes()
                       if route_manager.get_route(n).kind == "stt"]
         if stt_routes:
@@ -729,7 +741,7 @@ async def handle_stt_proxy(request):
                 status=503,
             )
 
-    runtime_name, err = _resolve_stt_runtime(rm)
+    runtime_name, err = _resolve_stt_runtime(rm, requested=requested_runtime)
     if err:
         return err
     if not rm.is_running(runtime_name):
@@ -972,7 +984,8 @@ async def handle_stt_health(request):
     """Expose STT runtime health through the proxy."""
     _require_client_auth(request)
     rm = request.app["rm"]
-    runtime_name, err = _resolve_stt_runtime(rm)
+    requested_runtime = request.headers.get(_STT_RUNTIME_HEADER, "").strip() or None
+    runtime_name, err = _resolve_stt_runtime(rm, requested=requested_runtime)
     if err:
         return err
     if not rm.is_running(runtime_name):
