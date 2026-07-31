@@ -16,6 +16,7 @@ from llm_proxy.resource_coordinator import ResourceCoordinator
 from llm_proxy.route_manager import RouteManager
 from llm_proxy.runtime_manager import RuntimeManager
 from llm_proxy.slot_manager import SlotManager
+from llm_proxy.statistics import StatisticsStore
 from llm_proxy.router import create_api_app, create_control_app
 
 
@@ -26,12 +27,16 @@ async def run(config):
     auth = AuthManager(config)
     routes = RouteManager(config)
     kv_cache = KVCacheManager(config, sm)
+    statistics = StatisticsStore(config)
+    await statistics.start()
     coordinator.register("runtime", rm.list_running_on_gpu, rm.stop)
     api_app = create_api_app(rm, sm, auth, route_manager=routes)
     control_app = create_control_app(rm, sm, auth, route_manager=routes)
     api_app["config"] = config
     control_app["config"] = config
     control_app["kv_cache"] = kv_cache
+    api_app["statistics"] = statistics
+    control_app["statistics"] = statistics
 
     listen = config["listen"]
     api_host = listen["host"] if isinstance(listen, dict) else "0.0.0.0"
@@ -84,6 +89,7 @@ async def run(config):
     await routes.stop_monitoring()
     await api_runner.cleanup()
     await control_runner.cleanup()
+    await statistics.stop()
 
 
 def main():

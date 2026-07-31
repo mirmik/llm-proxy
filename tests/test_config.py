@@ -63,6 +63,18 @@ class ConfigRuntimeTests(unittest.TestCase):
         self.assertNotIn("profiles", runtime)
         self.assertNotIn("default_profile", runtime)
 
+    def test_statistics_defaults_are_privacy_preserving(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.yaml")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{}\n")
+            config = load_config(path)
+
+        self.assertTrue(config["statistics"]["enabled"])
+        self.assertEqual(config["statistics"]["client_identity"], "token")
+        self.assertFalse(config["statistics"]["include_host"])
+        self.assertEqual(config["statistics"]["retention_days"], 30)
+
 
 if __name__ == "__main__":
     unittest.main()

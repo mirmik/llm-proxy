@@ -32,6 +32,14 @@ DEFAULT_CONFIG = {
     "runtimes": {},
     "hosts": {},
     "routes": {},
+    "statistics": {
+        "enabled": True,
+        "database": None,
+        "retention_days": 30,
+        "cleanup_interval_hours": 24,
+        "client_identity": "token",
+        "include_host": False,
+    },
     "kv_cache": {
         "cleanup_enabled": True,
         "ttl_hours": 168,
@@ -88,6 +96,8 @@ def load_config(path=None):
     for name, route in (config.get("routes") or {}).items():
         _validate_route(name, route)
 
+    _validate_statistics(config.get("statistics") or {})
+
     return config
 
 
@@ -139,6 +149,20 @@ def _validate_route(name, route):
     kind = route.get("kind", "llm")
     if kind not in ("llm", "stt", "tts"):
         raise ValueError(f"Route '{name}' has unknown kind: {kind}")
+
+
+def _validate_statistics(statistics):
+    try:
+        retention_days = float(statistics.get("retention_days", 30))
+        cleanup_hours = float(statistics.get("cleanup_interval_hours", 24))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("statistics retention/cleanup values must be numbers") from exc
+    if retention_days < 0:
+        raise ValueError("statistics.retention_days must be >= 0")
+    if cleanup_hours <= 0:
+        raise ValueError("statistics.cleanup_interval_hours must be > 0")
+    if statistics.get("client_identity", "token") not in ("token", "none"):
+        raise ValueError("statistics.client_identity must be 'token' or 'none'")
 
 
 def _normalize_runtime(runtime):

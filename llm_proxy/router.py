@@ -10,6 +10,7 @@ from aiohttp import web
 from llm_proxy.certs import certificate_fingerprint, generate_server_cert
 from llm_proxy.config import load_config_file, save_config_file
 from llm_proxy.oplog import elapsed_ms, log_event, now
+from llm_proxy.statistics import RequestTrace, SSEUsageParser, apply_usage
 
 _SESSION_BODY_KEYS = (
     "session_id",
@@ -43,6 +44,13 @@ _SESSION_HEADER_KEYS = (
 _QWEN_MAIN_PROMPT_DELIMITER = "########"
 _TRANSIENT_SESSION = object()
 _STT_RUNTIME_HEADER = "X-STT-Runtime"
+_STATISTICS_PERIODS = {
+    "1h": (3600, 300),
+    "24h": (86400, 3600),
+    "7d": (7 * 86400, 6 * 3600),
+    "30d": (30 * 86400, 86400),
+    "all": (None, 86400),
+}
 
 
 def _setup_app(rm, sm, auth, routes=None):
@@ -70,6 +78,46 @@ def _backend_label(url):
     if parsed.netloc:
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
     return url
+
+
+def _json_size(value):
+    return len(json.dumps(value).encode("utf-8"))
+
+
+def _response_size(response):
+    body = getattr(response, "body", None)
+    return len(body) if body else 0
+
+
+def _new_trace(request, *, kind, client, requested_model=None, stream=False, input_bytes=0):
+    store = request.app.get("statistics")
+    if store is None or not store.enabled:
+        return None
+    settings = ((request.app.get("config") or {}).get("statistics") or {})
+    include_host = bool(settings.get("include_host", False))
+    identity = client or "anonymous"
+    if settings.get("client_identity", "token") == "none":
+        identity = "anonymous"
+    return RequestTrace(
+        store,
+        kind=kind,
+        client=identity,
+        host=_client_host(request) if include_host else None,
+        requested_model=requested_model,
+        stream=stream,
+        input_bytes=input_bytes,
+    )
+
+
+def _finish_trace(trace, response, *, outcome=None, error=None):
+    if trace is not None:
+        trace.finish(
+            response.status,
+            outcome=outcome,
+            error=error,
+            output_bytes=_response_size(response),
+        )
+    return response
 
 
 def _session_label(session_id):
@@ -206,6 +254,8 @@ def create_control_app(runtime_manager, slot_manager, auth_manager=None, route_m
     app.router.add_post("/v1/control/runtimes/{name}/settings", handle_runtime_settings)
     app.router.add_get("/v1/control/runtimes/{name}/logs", handle_runtime_logs)
     app.router.add_get("/v1/control/state", handle_control_state)
+    app.router.add_get("/v1/control/statistics", handle_statistics)
+    app.router.add_delete("/v1/control/statistics", handle_statistics_clear)
     app.router.add_post("/v1/control/kv-cache/cleanup", handle_kv_cache_cleanup)
     app.router.add_post("/v1/control/models/{name}/load", handle_load)
     app.router.add_post("/v1/control/models/{name}/unload", handle_unload)
@@ -273,16 +323,25 @@ async def _acquire_slot(rm, sm, model_name, session_id, port):
 async def handle_chat(request):
     """Proxy /v1/chat/completions to the right backend (routed or local)."""
     request_started = now()
-    _require_client_auth(request)
+    client = _require_client_auth(request)
     rm = request.app["rm"]
     sm = request.app["sm"]
     route_manager = request.app.get("routes")
 
-    body = await request.json()
+    raw_body = await request.read()
+    body = json.loads(raw_body)
     model_name = body.get("model", "")
     session_id, session_source = _extract_session_marker(body, request.headers)
     stream = body.get("stream", False)
     host = _client_host(request)
+    trace = _new_trace(
+        request,
+        kind="chat",
+        client=client,
+        requested_model=model_name,
+        stream=stream,
+        input_bytes=len(raw_body),
+    )
     log_event(
         "request received",
         kind="chat",
@@ -296,11 +355,15 @@ async def handle_chat(request):
     model_name, err = _resolve_model(rm, model_name, route_manager=route_manager)
     if err:
         log_event("request rejected", kind="chat", host=host, model=model_name, ms=elapsed_ms(request_started))
-        return err
+        return _finish_trace(trace, err, outcome="rejected", error="rejected")
+    if trace is not None:
+        trace.resolved_model = model_name
 
     if route_manager:
         route = route_manager.get_route(model_name)
         if route:
+            if trace is not None:
+                trace.route = route.name
             log_event("request route", kind="chat", host=host, model=model_name, route=route.name)
             return await _proxy_routed(
                 request,
@@ -310,6 +373,7 @@ async def handle_chat(request):
                 request_started,
                 session_id=session_id,
                 session_source=session_source,
+                trace=trace,
             )
 
     if not rm.is_running(model_name):
@@ -322,24 +386,27 @@ async def handle_chat(request):
             except Exception as e:
                 log_event("runtime ensure failed", runtime=model_name, ms=elapsed_ms(ensure_started), error=e)
                 log_event("request failed", kind="chat", host=host, model=model_name, status=503, ms=elapsed_ms(request_started), error=e)
-                return web.json_response(
+                response = web.json_response(
                     {"error": f"Failed to start {model_name} on demand: {e}"},
                     status=503,
                 )
+                return _finish_trace(trace, response, error=e)
         else:
             log_event("request rejected", kind="chat", host=host, model=model_name, status=503, reason="model-not-loaded", ms=elapsed_ms(request_started))
-            return web.json_response(
+            response = web.json_response(
                 {"error": f"Model '{model_name}' is not loaded. Load it explicitly via control API or web UI, or enable on_demand."},
                 status=503,
             )
+            return _finish_trace(trace, response, outcome="rejected", error="rejected")
 
     port = rm.get_port(model_name)
     if not port:
         log_event("request rejected", kind="chat", host=host, model=model_name, status=503, reason="missing-port", ms=elapsed_ms(request_started))
-        return web.json_response(
+        response = web.json_response(
             {"error": f"Model '{model_name}' is marked running but has no bound port."},
             status=503,
         )
+        return _finish_trace(trace, response, outcome="rejected", error="rejected")
 
     slot_id = await _acquire_slot(rm, sm, model_name, session_id, port)
     _strip_local_session_markers(body)
@@ -347,6 +414,8 @@ async def handle_chat(request):
         body["id_slot"] = slot_id
 
     backend_url = f"http://127.0.0.1:{port}/v1/chat/completions"
+    if trace is not None:
+        trace.runtime = model_name
     log_event(
         "request forward",
         kind="chat",
@@ -365,13 +434,17 @@ async def handle_chat(request):
                 request,
                 backend_url,
                 body,
-                op={"kind": "chat", "host": host, "model": model_name, "started": request_started},
+                op={"kind": "chat", "host": host, "model": model_name,
+                    "runtime": model_name, "backend": _backend_label(backend_url),
+                    "started": request_started, "trace": trace},
             )
         else:
             return await _proxy_json(
                 backend_url,
                 body,
-                op={"kind": "chat", "host": host, "model": model_name, "started": request_started},
+                op={"kind": "chat", "host": host, "model": model_name,
+                    "runtime": model_name, "backend": _backend_label(backend_url),
+                    "started": request_started, "trace": trace},
             )
     finally:
         if slot_id is not None:
@@ -386,6 +459,7 @@ async def _proxy_routed(
     request_started=None,
     session_id=None,
     session_source=None,
+    trace=None,
 ):
     """Forward request through a Route's failover chain."""
     from llm_proxy.route_manager import _derive_endpoint_url
@@ -395,6 +469,8 @@ async def _proxy_routed(
     for backend in candidates:
         url = _derive_endpoint_url(backend["url"], route.kind)
         body["model"] = backend.get("model", route.name)
+        if trace is not None:
+            trace.resolved_model = body["model"]
         headers = route._auth_headers(backend)
         _add_session_header(headers, session_id)
         host = _client_host(request)
@@ -420,7 +496,10 @@ async def _proxy_routed(
                     body,
                     headers,
                     backend=backend,
-                    op={"kind": route.kind, "host": host, "model": body["model"], "started": request_started or now()},
+                    op={"kind": route.kind, "host": host, "model": body["model"],
+                        "route": route.name, "backend": _backend_label(url),
+                        "route_reason": backend.get("_route_reason"),
+                        "started": request_started or now(), "trace": trace},
                 )
                 return response
             else:
@@ -429,7 +508,10 @@ async def _proxy_routed(
                     body,
                     headers,
                     backend=backend,
-                    op={"kind": route.kind, "host": host, "model": body["model"], "started": request_started or now()},
+                    op={"kind": route.kind, "host": host, "model": body["model"],
+                        "route": route.name, "backend": _backend_label(url),
+                        "route_reason": backend.get("_route_reason"),
+                        "started": request_started or now(), "trace": trace},
                 )
                 return response
         except Exception as e:
@@ -449,10 +531,11 @@ async def _proxy_routed(
             route.note_request_end(session_id, backend["url"])
 
     log_event("request failed", kind=route.kind, route=route.name, ms=elapsed_ms(request_started or now()))
-    return web.json_response(
+    response = web.json_response(
         {"error": f"All backends failed for '{route.name}'. Last error: {last_err}"},
         status=503,
     )
+    return _finish_trace(trace, response, error="all-backends-failed")
 
 
 async def _proxy_json_inline(url, body, headers, backend=None, op=None):
@@ -460,17 +543,29 @@ async def _proxy_json_inline(url, body, headers, backend=None, op=None):
     from llm_proxy.route_manager import backend_client_kwargs
 
     timeout = aiohttp.ClientTimeout(total=300)
-    async with aiohttp.ClientSession(**backend_client_kwargs(backend or {})) as sess:
-        async with sess.post(url, json=body, headers=headers, timeout=timeout) as resp:
-            data = await resp.json()
-            if resp.status >= 500:
-                raise aiohttp.ClientResponseError(
-                    resp.request_info, resp.history, status=resp.status,
-                    message=data.get("error", f"HTTP {resp.status}"),
-                    headers=resp.headers,
-                )
-            _log_proxy_done(op, resp.status)
-            return web.json_response(data, status=resp.status)
+    attempt = _start_attempt(op, body)
+    try:
+        async with aiohttp.ClientSession(**backend_client_kwargs(backend or {})) as sess:
+            async with sess.post(url, json=body, headers=headers, timeout=timeout) as resp:
+                raw = await resp.read()
+                data = json.loads(raw)
+                apply_usage(op.get("trace") if op else None, data)
+                if attempt is not None:
+                    attempt.finish(resp.status, output_bytes=len(raw))
+                if resp.status >= 500:
+                    message = data.get("error", f"HTTP {resp.status}") if isinstance(data, dict) else f"HTTP {resp.status}"
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history, status=resp.status,
+                        message=message,
+                        headers=resp.headers,
+                    )
+                output_bytes = _json_size(data)
+                _log_proxy_done(op, resp.status, output_bytes=output_bytes)
+                return web.json_response(data, status=resp.status)
+    except Exception as e:
+        if attempt is not None:
+            attempt.finish(getattr(e, "status", 502), error=e)
+        raise
 
 
 async def _proxy_stream_inline(request, url, body, headers, backend=None, op=None):
@@ -478,44 +573,73 @@ async def _proxy_stream_inline(request, url, body, headers, backend=None, op=Non
     from llm_proxy.route_manager import backend_client_kwargs
 
     timeout = aiohttp.ClientTimeout(total=300)
-    async with aiohttp.ClientSession(**backend_client_kwargs(backend or {})) as sess:
-        async with sess.post(url, json=body, headers=headers, timeout=timeout) as backend_resp:
-            if backend_resp.status >= 500:
-                text = await backend_resp.text()
-                raise aiohttp.ClientResponseError(
-                    backend_resp.request_info, backend_resp.history, status=backend_resp.status,
-                    message=text or f"HTTP {backend_resp.status}",
-                    headers=backend_resp.headers,
+    attempt = _start_attempt(op, body)
+    backend_bytes = 0
+    client_bytes = 0
+    usage_parser = _usage_parser(op)
+    try:
+        async with aiohttp.ClientSession(**backend_client_kwargs(backend or {})) as sess:
+            async with sess.post(url, json=body, headers=headers, timeout=timeout) as backend_resp:
+                if backend_resp.status >= 500:
+                    raw = await backend_resp.read()
+                    backend_bytes += len(raw)
+                    if attempt is not None:
+                        attempt.finish(backend_resp.status, error=RuntimeError(), output_bytes=backend_bytes)
+                    raise aiohttp.ClientResponseError(
+                        backend_resp.request_info, backend_resp.history, status=backend_resp.status,
+                        message=f"HTTP {backend_resp.status}",
+                        headers=backend_resp.headers,
+                    )
+                status = backend_resp.status
+                response = web.StreamResponse(
+                    status=status,
+                    headers={
+                        "Content-Type": "text/event-stream",
+                        "Cache-Control": "no-cache",
+                    },
                 )
-            status = backend_resp.status
-            response = web.StreamResponse(
-                status=status,
-                headers={
-                    "Content-Type": "text/event-stream",
-                    "Cache-Control": "no-cache",
-                },
-            )
-            await response.prepare(request)
-            async for chunk in backend_resp.content.iter_any():
-                await response.write(chunk)
-    await response.write_eof()
-    _log_proxy_done(op, status)
-    return response
+                await response.prepare(request)
+                async for chunk in backend_resp.content.iter_any():
+                    backend_bytes += len(chunk)
+                    if usage_parser is not None:
+                        usage_parser.feed(chunk)
+                    _note_first_output(op)
+                    await response.write(chunk)
+                    client_bytes += len(chunk)
+        await response.write_eof()
+        if usage_parser is not None:
+            usage_parser.finish()
+        if attempt is not None:
+            attempt.finish(status, output_bytes=backend_bytes)
+        _log_proxy_done(op, status, output_bytes=client_bytes)
+        return response
+    except Exception as e:
+        if attempt is not None:
+            attempt.finish(getattr(e, "status", 502), error=e, output_bytes=backend_bytes)
+        raise
 
 
 async def _proxy_json(url, body, extra_headers=None, op=None):
     """Forward request and return JSON response."""
+    attempt = _start_attempt(op, body)
     try:
         async with aiohttp.ClientSession() as sess:
             headers = extra_headers or {}
             async with sess.post(url, json=body, headers=headers,
                                 timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                data = await resp.json()
-                _log_proxy_done(op, resp.status)
+                raw = await resp.read()
+                data = json.loads(raw)
+                apply_usage(op.get("trace") if op else None, data)
+                if attempt is not None:
+                    attempt.finish(resp.status, output_bytes=len(raw))
+                _log_proxy_done(op, resp.status, output_bytes=_json_size(data))
                 return web.json_response(data, status=resp.status)
     except Exception as e:
-        _log_proxy_done(op, 502, error=e)
-        return web.json_response({"error": str(e)}, status=502)
+        if attempt is not None:
+            attempt.finish(502, error=e)
+        payload = {"error": str(e)}
+        _log_proxy_done(op, 502, error=e, output_bytes=_json_size(payload))
+        return web.json_response(payload, status=502)
 
 
 async def _proxy_stream(request, url, body, extra_headers=None, op=None):
@@ -529,6 +653,10 @@ async def _proxy_stream(request, url, body, extra_headers=None, op=None):
     )
     await response.prepare(request)
 
+    attempt = _start_attempt(op, body)
+    backend_bytes = 0
+    client_bytes = 0
+    usage_parser = _usage_parser(op)
     try:
         timeout = aiohttp.ClientTimeout(total=300)
         async with aiohttp.ClientSession() as sess:
@@ -536,21 +664,37 @@ async def _proxy_stream(request, url, body, extra_headers=None, op=None):
             async with sess.post(url, json=body, headers=headers, timeout=timeout) as backend:
                 status = backend.status
                 async for chunk in backend.content.iter_any():
+                    backend_bytes += len(chunk)
+                    if usage_parser is not None:
+                        usage_parser.feed(chunk)
+                    _note_first_output(op)
                     await response.write(chunk)
+                    client_bytes += len(chunk)
     except (aiohttp.ClientConnectionResetError, ConnectionResetError, BrokenPipeError) as e:
-        _log_proxy_done(op, 499, error="client-disconnect")
+        if attempt is not None:
+            attempt.finish(499, error="client-disconnect", output_bytes=backend_bytes)
+        _log_proxy_done(op, 499, error="client-disconnect", output_bytes=client_bytes)
         return response
     except Exception as e:
         status = 502
         error_chunk = f"data: {json.dumps({'error': str(e)})}\n\n"
         try:
             await response.write(error_chunk.encode())
+            client_bytes += len(error_chunk.encode())
         except (aiohttp.ClientConnectionResetError, ConnectionResetError, BrokenPipeError):
-            _log_proxy_done(op, 499, error="client-disconnect")
+            if attempt is not None:
+                attempt.finish(499, error="client-disconnect", output_bytes=backend_bytes)
+            _log_proxy_done(op, 499, error="client-disconnect", output_bytes=client_bytes)
             return response
-        _log_proxy_done(op, status, error=e)
+        if attempt is not None:
+            attempt.finish(status, error=e, output_bytes=backend_bytes)
+        _log_proxy_done(op, status, error=e, output_bytes=client_bytes)
     else:
-        _log_proxy_done(op, status)
+        if usage_parser is not None:
+            usage_parser.finish()
+        if attempt is not None:
+            attempt.finish(status, output_bytes=backend_bytes)
+        _log_proxy_done(op, status, output_bytes=client_bytes)
 
     try:
         await response.write_eof()
@@ -559,7 +703,36 @@ async def _proxy_stream(request, url, body, extra_headers=None, op=None):
     return response
 
 
-def _log_proxy_done(op, status, error=None):
+def _start_attempt(op, body, input_bytes=None):
+    trace = op.get("trace") if op else None
+    if trace is None:
+        return None
+    if input_bytes is None:
+        input_bytes = _json_size(body)
+    return trace.start_attempt(
+        model=op.get("model"),
+        runtime=op.get("runtime"),
+        route=op.get("route"),
+        backend=op.get("backend"),
+        route_reason=op.get("route_reason"),
+        input_bytes=input_bytes,
+    )
+
+
+def _note_first_output(op):
+    trace = op.get("trace") if op else None
+    if trace is not None and trace.ttft_ms is None:
+        trace.ttft_ms = elapsed_ms(op.get("started", now()))
+
+
+def _usage_parser(op):
+    trace = op.get("trace") if op else None
+    if trace is None or trace.kind != "chat":
+        return None
+    return SSEUsageParser(trace)
+
+
+def _log_proxy_done(op, status, error=None, output_bytes=0):
     if not op:
         return
     log_event(
@@ -571,6 +744,9 @@ def _log_proxy_done(op, status, error=None):
         ms=elapsed_ms(op.get("started", now())),
         error=error,
     )
+    trace = op.get("trace")
+    if trace is not None:
+        trace.finish(status, error=error, output_bytes=output_bytes)
 
 
 async def handle_models(request):
@@ -676,11 +852,19 @@ def _resolve_stt_runtime(rm, requested=None):
 async def handle_stt_proxy(request):
     """Proxy STT client traffic to the active STT runtime or route."""
     request_started = now()
-    _require_client_auth(request)
+    client = _require_client_auth(request)
     rm = request.app["rm"]
     route_manager = request.app.get("routes")
     host = _client_host(request)
     requested_runtime = request.headers.get(_STT_RUNTIME_HEADER, "").strip() or None
+    body = await request.read()
+    trace = _new_trace(
+        request,
+        kind="stt",
+        client=client,
+        requested_model=requested_runtime,
+        input_bytes=len(body),
+    )
     log_event("request received", kind="stt", host=host, runtime=requested_runtime)
 
     if route_manager and not requested_runtime:
@@ -689,8 +873,9 @@ async def handle_stt_proxy(request):
         if stt_routes:
             route_name = stt_routes[0]
             route = route_manager.get_route(route_name)
+            if trace is not None:
+                trace.route = route.name
             from llm_proxy.route_manager import _derive_endpoint_url
-            body = await request.read()
             candidates = route.failover_candidates()
             last_err = None
             for backend in candidates:
@@ -704,6 +889,14 @@ async def handle_stt_proxy(request):
                 query_string = request.query_string
                 if query_string:
                     url += "?" + query_string
+                route.note_request_start(None, backend["url"])
+                attempt = trace.start_attempt(
+                    model=backend.get("model", route.name),
+                    route=route.name,
+                    backend=_backend_label(url),
+                    route_reason=backend.get("_route_reason"),
+                    input_bytes=len(body),
+                ) if trace is not None else None
                 log_event("request forward", kind="stt", host=host, route=route.name, backend=_backend_label(url))
                 try:
                     async with aiohttp.ClientSession() as sess:
@@ -712,13 +905,19 @@ async def handle_stt_proxy(request):
                             timeout=aiohttp.ClientTimeout(total=300),
                         ) as resp:
                             if resp.status >= 500:
-                                text = await resp.text()
+                                raw = await resp.read()
+                                if attempt is not None:
+                                    attempt.finish(resp.status, error=RuntimeError(), output_bytes=len(raw))
                                 raise aiohttp.ClientResponseError(
                                     resp.request_info, resp.history, status=resp.status,
-                                    message=text or f"HTTP {resp.status}",
+                                    message=f"HTTP {resp.status}",
                                     headers=resp.headers,
                                 )
                             raw = await resp.read()
+                            if attempt is not None:
+                                attempt.finish(resp.status, output_bytes=len(raw))
+                            if trace is not None:
+                                trace.resolved_model = backend.get("model", route.name)
                             content_type = resp.headers.get("Content-Type", "application/json")
                             log_event(
                                 "request complete",
@@ -728,22 +927,31 @@ async def handle_stt_proxy(request):
                                 status=resp.status,
                                 ms=elapsed_ms(request_started),
                             )
-                            return web.Response(body=raw, status=resp.status,
-                                               content_type=content_type.split(";")[0])
+                            response = web.Response(body=raw, status=resp.status,
+                                                    content_type=content_type.split(";")[0])
+                            return _finish_trace(trace, response)
                 except Exception as e:
+                    if attempt is not None:
+                        attempt.finish(getattr(e, "status", 502), error=e)
                     await route.mark_unhealthy(backend["url"])
                     log_event("request backend failed", kind="stt", host=host, route=route.name, backend=_backend_label(url), error=e)
                     last_err = str(e)
                     continue
+                finally:
+                    route.note_request_end(None, backend["url"])
             log_event("request failed", kind="stt", host=host, route=route.name, ms=elapsed_ms(request_started))
-            return web.json_response(
+            response = web.json_response(
                 {"error": f"All STT backends failed. Last error: {last_err}"},
                 status=503,
             )
+            return _finish_trace(trace, response, error="all-backends-failed")
 
     runtime_name, err = _resolve_stt_runtime(rm, requested=requested_runtime)
     if err:
-        return err
+        return _finish_trace(trace, err, outcome="rejected", error="rejected")
+    if trace is not None:
+        trace.runtime = runtime_name
+        trace.resolved_model = runtime_name
     if not rm.is_running(runtime_name):
         if rm.on_demand(runtime_name):
             try:
@@ -754,26 +962,28 @@ async def handle_stt_proxy(request):
             except Exception as e:
                 log_event("runtime ensure failed", runtime=runtime_name, ms=elapsed_ms(ensure_started), error=e)
                 log_event("request failed", kind="stt", host=host, runtime=runtime_name, status=503, ms=elapsed_ms(request_started), error=e)
-                return web.json_response(
+                response = web.json_response(
                     {"error": f"Failed to start {runtime_name} on demand: {e}"},
                     status=503,
                 )
+                return _finish_trace(trace, response, error=e)
         else:
             log_event("request rejected", kind="stt", host=host, runtime=runtime_name, status=503, reason="runtime-not-loaded", ms=elapsed_ms(request_started))
-            return web.json_response(
+            response = web.json_response(
                 {"error": f"STT runtime '{runtime_name}' is not loaded. Start it explicitly via control API or web UI, or enable on_demand."},
                 status=503,
             )
+            return _finish_trace(trace, response, outcome="rejected", error="rejected")
     port = rm.get_port(runtime_name)
     if not port:
         log_event("request rejected", kind="stt", host=host, runtime=runtime_name, status=503, reason="missing-port", ms=elapsed_ms(request_started))
-        return web.json_response(
+        response = web.json_response(
             {"error": f"STT runtime '{runtime_name}' is marked running but has no bound port."},
             status=503,
         )
+        return _finish_trace(trace, response, outcome="rejected", error="rejected")
 
     backend_url = f"http://127.0.0.1:{port}/stt"
-    body = await request.read()
     headers = {}
     if request.content_type:
         headers["Content-Type"] = request.headers.get("Content-Type", request.content_type)
@@ -788,6 +998,12 @@ async def handle_stt_proxy(request):
     if query_string:
         backend_url += "?" + query_string
     log_event("request forward", kind="stt", host=host, runtime=runtime_name, backend=_backend_label(backend_url))
+    attempt = trace.start_attempt(
+        model=runtime_name,
+        runtime=runtime_name,
+        backend=_backend_label(backend_url),
+        input_bytes=len(body),
+    ) if trace is not None else None
 
     try:
         async with aiohttp.ClientSession() as sess:
@@ -798,6 +1014,8 @@ async def handle_stt_proxy(request):
                 timeout=aiohttp.ClientTimeout(total=300),
             ) as resp:
                 raw = await resp.read()
+                if attempt is not None:
+                    attempt.finish(resp.status, output_bytes=len(raw))
                 content_type = resp.headers.get("Content-Type", "application/json")
                 log_event(
                     "request complete",
@@ -807,10 +1025,14 @@ async def handle_stt_proxy(request):
                     status=resp.status,
                     ms=elapsed_ms(request_started),
                 )
-                return web.Response(body=raw, status=resp.status, content_type=content_type.split(";")[0])
+                response = web.Response(body=raw, status=resp.status, content_type=content_type.split(";")[0])
+                return _finish_trace(trace, response)
     except Exception as e:
+        if attempt is not None:
+            attempt.finish(502, error=e)
         log_event("request complete", kind="stt", host=host, runtime=runtime_name, status=502, ms=elapsed_ms(request_started), error=e)
-        return web.json_response({"error": str(e)}, status=502)
+        response = web.json_response({"error": str(e)}, status=502)
+        return _finish_trace(trace, response, error=e)
 
 
 def _resolve_tts_runtime(rm, requested=None):
@@ -835,35 +1057,55 @@ async def handle_tts_proxy(request):
     `voice` optionally selects the TTS runtime by name.
     """
     request_started = now()
-    _require_client_auth(request)
+    client = _require_client_auth(request)
     rm = request.app["rm"]
     route_manager = request.app.get("routes")
-    body = await request.json()
+    raw_body = await request.read()
+    body = json.loads(raw_body)
     requested = body.pop("voice", None) if isinstance(body, dict) else None
     host = _client_host(request)
+    trace = _new_trace(
+        request,
+        kind="tts",
+        client=client,
+        requested_model=requested,
+        input_bytes=len(raw_body),
+    )
     log_event("request received", kind="tts", host=host, runtime=requested)
 
     if route_manager and requested:
         route = route_manager.get_route(requested)
         if route and route.kind == "tts":
+            if trace is not None:
+                trace.route = route.name
             from llm_proxy.route_manager import _derive_endpoint_url
             candidates = route.failover_candidates()
             last_err = None
             for backend in candidates:
                 url = _derive_endpoint_url(backend["url"], "tts")
                 headers = route._auth_headers(backend)
+                route.note_request_start(None, backend["url"])
+                attempt = trace.start_attempt(
+                    model=backend.get("model", route.name),
+                    route=route.name,
+                    backend=_backend_label(url),
+                    route_reason=backend.get("_route_reason"),
+                    input_bytes=_json_size(body),
+                ) if trace is not None else None
                 log_event("request forward", kind="tts", host=host, route=route.name, backend=_backend_label(url))
                 try:
                     async with aiohttp.ClientSession() as sess:
                         async with sess.post(url, json=body, headers=headers,
                                             timeout=aiohttp.ClientTimeout(total=300)) as backend_resp:
                             if backend_resp.status >= 500:
-                                text = await backend_resp.text()
+                                raw = await backend_resp.read()
+                                if attempt is not None:
+                                    attempt.finish(backend_resp.status, error=RuntimeError(), output_bytes=len(raw))
                                 raise aiohttp.ClientResponseError(
                                     backend_resp.request_info,
                                     backend_resp.history,
                                     status=backend_resp.status,
-                                    message=text or f"HTTP {backend_resp.status}",
+                                    message=f"HTTP {backend_resp.status}",
                                     headers=backend_resp.headers,
                                 )
                             response = web.StreamResponse()
@@ -873,9 +1115,20 @@ async def handle_tts_proxy(request):
                                     continue
                                 response.headers[hk] = hv
                             await response.prepare(request)
+                            backend_bytes = 0
+                            client_bytes = 0
                             async for chunk in backend_resp.content.iter_any():
+                                backend_bytes += len(chunk)
+                                if trace is not None and trace.ttft_ms is None:
+                                    trace.ttft_ms = elapsed_ms(request_started)
                                 await response.write(chunk)
+                                client_bytes += len(chunk)
                             await response.write_eof()
+                            if attempt is not None:
+                                attempt.finish(backend_resp.status, output_bytes=backend_bytes)
+                            if trace is not None:
+                                trace.resolved_model = backend.get("model", route.name)
+                                trace.finish(backend_resp.status, output_bytes=client_bytes)
                             log_event(
                                 "request complete",
                                 kind="tts",
@@ -886,19 +1139,27 @@ async def handle_tts_proxy(request):
                             )
                             return response
                 except Exception as e:
+                    if attempt is not None:
+                        attempt.finish(getattr(e, "status", 502), error=e)
                     await route.mark_unhealthy(backend["url"])
                     log_event("request backend failed", kind="tts", host=host, route=route.name, backend=_backend_label(url), error=e)
                     last_err = str(e)
                     continue
+                finally:
+                    route.note_request_end(None, backend["url"])
             log_event("request failed", kind="tts", host=host, route=route.name, ms=elapsed_ms(request_started))
-            return web.json_response(
+            response = web.json_response(
                 {"error": f"All TTS backends failed. Last error: {last_err}"},
                 status=503,
             )
+            return _finish_trace(trace, response, error="all-backends-failed")
 
     runtime_name, err = _resolve_tts_runtime(rm, requested)
     if err:
-        return err
+        return _finish_trace(trace, err, outcome="rejected", error="rejected")
+    if trace is not None:
+        trace.runtime = runtime_name
+        trace.resolved_model = runtime_name
     if not rm.is_running(runtime_name):
         if rm.on_demand(runtime_name):
             try:
@@ -909,28 +1170,39 @@ async def handle_tts_proxy(request):
             except Exception as e:
                 log_event("runtime ensure failed", runtime=runtime_name, ms=elapsed_ms(ensure_started), error=e)
                 log_event("request failed", kind="tts", host=host, runtime=runtime_name, status=503, ms=elapsed_ms(request_started), error=e)
-                return web.json_response(
+                response = web.json_response(
                     {"error": f"Failed to start {runtime_name} on demand: {e}"},
                     status=503,
                 )
+                return _finish_trace(trace, response, error=e)
         else:
             log_event("request rejected", kind="tts", host=host, runtime=runtime_name, status=503, reason="runtime-not-loaded", ms=elapsed_ms(request_started))
-            return web.json_response(
+            response = web.json_response(
                 {"error": f"TTS runtime '{runtime_name}' is not loaded. Start it explicitly via control API or web UI, or enable on_demand."},
                 status=503,
             )
+            return _finish_trace(trace, response, outcome="rejected", error="rejected")
     port = rm.get_port(runtime_name)
     if not port:
         log_event("request rejected", kind="tts", host=host, runtime=runtime_name, status=503, reason="missing-port", ms=elapsed_ms(request_started))
-        return web.json_response(
+        response = web.json_response(
             {"error": f"TTS runtime '{runtime_name}' is marked running but has no bound port."},
             status=503,
         )
+        return _finish_trace(trace, response, outcome="rejected", error="rejected")
 
     backend_url = f"http://127.0.0.1:{port}/tts/generate"
     log_event("request forward", kind="tts", host=host, runtime=runtime_name, backend=_backend_label(backend_url))
+    attempt = trace.start_attempt(
+        model=runtime_name,
+        runtime=runtime_name,
+        backend=_backend_label(backend_url),
+        input_bytes=_json_size(body),
+    ) if trace is not None else None
     response = web.StreamResponse()
     status = None
+    backend_bytes = 0
+    client_bytes = 0
     try:
         async with aiohttp.ClientSession() as sess:
             async with sess.post(backend_url, json=body, timeout=aiohttp.ClientTimeout(total=300)) as backend:
@@ -942,16 +1214,29 @@ async def handle_tts_proxy(request):
                     response.headers[hk] = hv
                 await response.prepare(request)
                 async for chunk in backend.content.iter_any():
+                    backend_bytes += len(chunk)
+                    if trace is not None and trace.ttft_ms is None:
+                        trace.ttft_ms = elapsed_ms(request_started)
                     await response.write(chunk)
+                    client_bytes += len(chunk)
     except Exception as e:
+        if attempt is not None:
+            attempt.finish(502, error=e, output_bytes=backend_bytes)
         if not response.prepared:
             log_event("request complete", kind="tts", host=host, runtime=runtime_name, status=502, ms=elapsed_ms(request_started), error=e)
-            return web.json_response({"error": str(e)}, status=502)
+            error_response = web.json_response({"error": str(e)}, status=502)
+            return _finish_trace(trace, error_response, error=e)
         log_event("request complete", kind="tts", host=host, runtime=runtime_name, status=502, ms=elapsed_ms(request_started), error=e)
         await response.write_eof()
+        if trace is not None:
+            trace.finish(502, error=e, output_bytes=client_bytes)
         return response
 
     await response.write_eof()
+    if attempt is not None:
+        attempt.finish(status, output_bytes=backend_bytes)
+    if trace is not None:
+        trace.finish(status, output_bytes=client_bytes)
     log_event("request complete", kind="tts", host=host, runtime=runtime_name, status=status, ms=elapsed_ms(request_started))
     return response
 
@@ -1171,6 +1456,59 @@ async def handle_control_state(request):
     runtimes = rm.list_state()
     models = [rt for rt in runtimes if rt["kind"] == "llm"]
     return web.json_response({"models": models, "runtimes": runtimes})
+
+
+async def handle_statistics(request):
+    """GET /v1/control/statistics — dashboard aggregates for a fixed period."""
+    _require_control_auth(request)
+    period = request.query.get("period", "24h")
+    if period not in _STATISTICS_PERIODS:
+        return web.json_response(
+            {"error": f"Unknown period '{period}'. Available: {list(_STATISTICS_PERIODS)}"},
+            status=400,
+        )
+    store = request.app.get("statistics")
+    if store is None or not store.enabled:
+        return web.json_response(_empty_statistics_payload(period))
+    await store.flush()
+    period_seconds, bucket_seconds = _STATISTICS_PERIODS[period]
+    payload = store.overview(period_seconds=period_seconds, bucket_seconds=bucket_seconds)
+    payload["period"] = period
+    return web.json_response(payload)
+
+
+async def handle_statistics_clear(request):
+    """DELETE /v1/control/statistics — clear retained rows, preserving schema."""
+    _require_control_auth(request)
+    store = request.app.get("statistics")
+    if store is None or not store.enabled:
+        return web.json_response({"ok": True, "deleted": {"requests": 0, "attempts": 0}})
+    deleted = await store.clear()
+    return web.json_response({"ok": True, "deleted": deleted})
+
+
+def _empty_statistics_payload(period):
+    return {
+        "enabled": False,
+        "period": period,
+        "retention_days": None,
+        "range": None,
+        "summary": {
+            "requests": 0, "successful": 0, "errors": 0, "inflight": 0,
+            "attempts": 0, "failovers": 0,
+            "client_input_bytes": 0, "client_output_bytes": 0,
+            "upstream_input_bytes": 0, "upstream_output_bytes": 0,
+            "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
+            "usage_coverage": 0.0, "tokens_per_second": None,
+            "latency_ms": {"avg": None, "p50": None, "p95": None, "max": None},
+        },
+        "series": [],
+        "breakdown": {name: [] for name in (
+            "kind", "model", "runtime", "route", "client", "backend", "routing_reason"
+        )},
+        "recent_errors": [],
+        "slow_requests": [],
+    }
 
 
 async def handle_kv_cache_cleanup(request):
