@@ -1,6 +1,31 @@
+import asyncio
 import unittest
+from unittest.mock import patch
 
-from llm_proxy.route_manager import Route, backend_client_kwargs
+from llm_proxy.route_manager import Route, RouteManager, backend_client_kwargs
+
+
+class _DummyResponse:
+    status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _DummyClientSession:
+    def __init__(self):
+        self.closed = False
+        self.requests = []
+
+    def get(self, url, **kwargs):
+        self.requests.append((url, kwargs))
+        return _DummyResponse()
+
+    async def close(self):
+        self.closed = True
 
 
 class RouteSessionDispatchTests(unittest.IsolatedAsyncioTestCase):
@@ -11,6 +36,43 @@ class RouteSessionDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(connector)
         self.assertFalse(connector._ssl)
         await connector.close()
+
+    async def test_probe_reuses_provided_session_with_per_request_tls_setting(self):
+        session = _DummyClientSession()
+        route = Route(
+            "model",
+            [{"url": "https://host:8090", "tls_verify": False}],
+        )
+
+        ok, latency = await route.probe("https://host:8090", session=session)
+        second_ok, _ = await route.probe("https://host:8090", session=session)
+
+        self.assertTrue(ok)
+        self.assertTrue(second_ok)
+        self.assertIsNotNone(latency)
+        self.assertFalse(session.closed)
+        self.assertEqual(len(session.requests), 2)
+        self.assertIs(session.requests[0][1]["ssl"], False)
+
+    async def test_monitor_closes_shared_health_session_on_stop(self):
+        session = _DummyClientSession()
+        manager = RouteManager({
+            "routes": {
+                "model": {
+                    "backends": [{"url": "http://host:8090"}],
+                    "check_interval": 60,
+                },
+            },
+        })
+
+        with patch("llm_proxy.route_manager.aiohttp.ClientSession", return_value=session) as factory:
+            await manager.start_monitoring()
+            await asyncio.sleep(0)
+            await manager.stop_monitoring()
+
+        factory.assert_called_once_with()
+        self.assertTrue(session.closed)
+        self.assertIsNone(manager._health_session)
 
     def test_new_sessions_use_least_loaded_backend(self):
         route = Route(
