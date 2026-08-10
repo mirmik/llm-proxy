@@ -233,6 +233,7 @@ def create_api_app(runtime_manager, slot_manager, auth_manager=None, route_manag
     app.router.add_get("/tts/health", handle_tts_health)
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_get("/v1/models", handle_models)
+    app.router.add_get("/v1/capabilities", handle_capabilities)
     app.router.add_get("/health", handle_health)
     return app
 
@@ -766,6 +767,8 @@ async def handle_models(request):
     if route_manager:
         for name in route_manager.available_routes():
             route = route_manager.get_route(name)
+            if route and route.kind != "llm":
+                continue
             models.append({
                 "id": name,
                 "object": "model",
@@ -775,6 +778,28 @@ async def handle_models(request):
                 "route_kind": route.kind if route else None,
             })
     return web.json_response({"object": "list", "data": models})
+
+
+async def handle_capabilities(request):
+    """Public protocol discovery for zero-configuration nemor-link clients."""
+    rm = request.app["rm"]
+    route_manager = request.app.get("routes")
+    auth = request.app.get("auth")
+    services = {
+        "llm": bool(rm.available_models()),
+        "stt": bool(rm.runtimes_by_kind("stt")),
+        "tts": bool(rm.runtimes_by_kind("tts")),
+    }
+    if route_manager:
+        for name in route_manager.available_routes():
+            route = route_manager.get_route(name)
+            if route and route.kind in services:
+                services[route.kind] = True
+    return web.json_response({
+        "protocol": 1,
+        "auth_required": bool(auth and auth.enabled),
+        "services": services,
+    })
 
 
 async def handle_load(request):

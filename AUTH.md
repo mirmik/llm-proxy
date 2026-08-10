@@ -1,6 +1,9 @@
 # API Tokens
 
-`llm-proxy` uses one mechanism for API auth: long-lived bearer tokens that you create on the server and copy into client configs. Same idea as a GitHub personal access token.
+`llm-proxy` uses one mechanism for API auth: long-lived bearer tokens that you
+create on the server and give to a client. Same idea as a GitHub personal
+access token. `nemor-link` stores the token in its machine-managed connection
+state; users do not need to write a client config.
 
 ## Config
 
@@ -56,6 +59,15 @@ curl -X DELETE http://127.0.0.1:8080/v1/control/tokens/<id-or-name> \
 ```
 
 ## Using a token
+
+For an integrated `nemor-link` utility:
+
+```console
+commit --set-token lp_<id>_<secret>
+```
+
+The selection is shared by `commit`, `ask`, `summarize`, and other clients of
+the same nemor-link state.
 
 Clients send a single header:
 
