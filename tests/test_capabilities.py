@@ -48,6 +48,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["auth_required"])
         self.assertEqual(payload["services"], {
             "llm": True,
+            "embedding": False,
             "stt": True,
             "tts": True,
         })

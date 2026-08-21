@@ -231,6 +231,7 @@ def create_api_app(runtime_manager, slot_manager, auth_manager=None, route_manag
     app.router.add_get("/stt/health", handle_stt_health)
     app.router.add_post("/v1/audio/speech", handle_tts_proxy)
     app.router.add_get("/tts/health", handle_tts_health)
+    app.router.add_post("/v1/embeddings", handle_embeddings)
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/v1/capabilities", handle_capabilities)
@@ -310,6 +311,136 @@ def _resolve_model(rm, model_name, route_manager=None):
     return None, web.json_response(
         {"error": f"Ambiguous model: {model_name}. Matches: {matched}"},
         status=400,
+    )
+
+
+def _resolve_runtime_by_kind(rm, model_name, kind):
+    """Resolve a local runtime without allowing names from another service kind."""
+    runtimes = rm.runtimes_by_kind(kind)
+    if model_name in runtimes:
+        return model_name, None
+    matched = [name for name in runtimes if model_name in name]
+    if len(matched) == 1:
+        return matched[0], None
+    if not matched:
+        return None, web.json_response(
+            {
+                "error": f"Unknown {kind} model: {model_name}",
+                "available": runtimes,
+            },
+            status=404,
+        )
+    return None, web.json_response(
+        {
+            "error": f"Ambiguous {kind} model: {model_name}",
+            "matches": matched,
+        },
+        status=400,
+    )
+
+
+async def handle_embeddings(request):
+    """Proxy OpenAI-compatible embeddings to a local embedding runtime."""
+    request_started = now()
+    client = _require_client_auth(request)
+    rm = request.app["rm"]
+    host = _client_host(request)
+    raw_body = await request.read()
+    trace = _new_trace(
+        request,
+        kind="embedding",
+        client=client,
+        input_bytes=len(raw_body),
+    )
+
+    try:
+        body = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        response = web.json_response({"error": "Request body must be valid JSON"}, status=400)
+        return _finish_trace(trace, response, outcome="rejected", error=e)
+    if not isinstance(body, dict):
+        response = web.json_response({"error": "Request body must be a JSON object"}, status=400)
+        return _finish_trace(trace, response, outcome="rejected", error="invalid-json-shape")
+
+    requested_model = body.get("model")
+    if not isinstance(requested_model, str) or not requested_model.strip():
+        response = web.json_response({"error": "'model' must be a non-empty string"}, status=400)
+        return _finish_trace(trace, response, outcome="rejected", error="invalid-model")
+    requested_model = requested_model.strip()
+    if trace is not None:
+        trace.requested_model = requested_model
+
+    runtime_name, err = _resolve_runtime_by_kind(rm, requested_model, "embedding")
+    if err:
+        log_event(
+            "request rejected",
+            kind="embedding",
+            host=host,
+            model=requested_model,
+            status=err.status,
+            ms=elapsed_ms(request_started),
+        )
+        return _finish_trace(trace, err, outcome="rejected", error="rejected")
+    if trace is not None:
+        trace.runtime = runtime_name
+        trace.resolved_model = runtime_name
+
+    log_event("request received", kind="embedding", host=host, model=requested_model, runtime=runtime_name)
+    if not rm.is_running(runtime_name):
+        if rm.on_demand(runtime_name):
+            try:
+                ensure_started = now()
+                log_event("runtime ensure", runtime=runtime_name, reason="on-demand")
+                await rm.ensure(runtime_name)
+                log_event("runtime ensured", runtime=runtime_name, ms=elapsed_ms(ensure_started))
+            except Exception as e:
+                log_event("runtime ensure failed", runtime=runtime_name, error=e)
+                response = web.json_response(
+                    {"error": f"Failed to start {runtime_name} on demand: {e}"},
+                    status=503,
+                )
+                return _finish_trace(trace, response, error=e)
+        else:
+            response = web.json_response(
+                {
+                    "error": (
+                        f"Embedding runtime '{runtime_name}' is not loaded. Start it explicitly "
+                        "via the control API or web UI, or enable on_demand."
+                    )
+                },
+                status=503,
+            )
+            return _finish_trace(trace, response, outcome="rejected", error="rejected")
+
+    port = rm.get_port(runtime_name)
+    if not port:
+        response = web.json_response(
+            {"error": f"Embedding runtime '{runtime_name}' is running but has no bound port."},
+            status=503,
+        )
+        return _finish_trace(trace, response, outcome="rejected", error="rejected")
+
+    backend_url = f"http://127.0.0.1:{port}/v1/embeddings"
+    log_event(
+        "request forward",
+        kind="embedding",
+        host=host,
+        model=requested_model,
+        runtime=runtime_name,
+        backend=_backend_label(backend_url),
+    )
+    return await _proxy_json(
+        backend_url,
+        body,
+        op={
+            "kind": "embedding",
+            "host": host,
+            "model": requested_model,
+            "runtime": runtime_name,
+            "backend": _backend_label(backend_url),
+            "started": request_started,
+            "trace": trace,
+        },
     )
 
 
@@ -787,6 +918,7 @@ async def handle_capabilities(request):
     auth = request.app.get("auth")
     services = {
         "llm": bool(rm.available_models()),
+        "embedding": bool(rm.runtimes_by_kind("embedding")),
         "stt": bool(rm.runtimes_by_kind("stt")),
         "tts": bool(rm.runtimes_by_kind("tts")),
     }

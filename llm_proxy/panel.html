@@ -332,6 +332,7 @@
         <div class="field"><label>Driver</label>
           <select id="nr-driver">
             <option value="llama_cpp">llama_cpp</option>
+            <option value="llama_cpp_embedding">llama_cpp_embedding</option>
             <option value="vllm">vllm</option>
             <option value="custom">custom</option>
           </select>
@@ -339,6 +340,7 @@
         <div class="field"><label>Kind</label>
           <select id="nr-kind">
             <option value="llm">llm</option>
+            <option value="embedding">embedding</option>
             <option value="stt">stt</option>
             <option value="tts">tts</option>
           </select>
@@ -872,11 +874,14 @@
   const newRuntimeBtn = document.getElementById("newRuntimeBtn");
   const newRuntimeCloseBtn = document.getElementById("newRuntimeCloseBtn");
   const nrDriver = document.getElementById("nr-driver");
+  const nrKind = document.getElementById("nr-kind");
   const nrVenvWrap = document.getElementById("nr-venv-wrap");
   const nrSlotsWrap = document.getElementById("nr-slots-wrap");
 
   function syncDriverFields() {
     const d = nrDriver.value;
+    if (d === "llama_cpp_embedding") nrKind.value = "embedding";
+    else if (d === "llama_cpp") nrKind.value = "llm";
     nrVenvWrap.hidden = !(d === "vllm" || d === "custom");
     nrSlotsWrap.hidden = (d === "stt" || d === "tts");
   }

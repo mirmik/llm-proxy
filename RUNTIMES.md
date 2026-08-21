@@ -13,15 +13,13 @@ Implemented:
 
 - `RuntimeManager` as the unified process owner
 - `llama_cpp` driver
+- `llama_cpp_embedding` driver and OpenAI-compatible `/v1/embeddings`
 - config section `runtimes:`
 - control API for listing runtimes, starting/stopping runtimes, and reading logs
 - CLI control commands backed by the same control API
 
-Not migrated yet:
-
-- `faster_whisper` driver
-- `xtts` driver
-- dedicated in-repo runner modules for STT/TTS
+Embedding runtime configuration and API behavior are documented in
+`EMBEDDINGS.md`.
 
 ## Driver Contract
 

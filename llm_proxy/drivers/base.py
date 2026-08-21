@@ -1,6 +1,6 @@
 """Base interface for runtime drivers.
 
-Drivers are thin: each one knows its `kind` (llm/stt/tts/generic) and
+Drivers are thin: each one knows its `kind` (llm/embedding/stt/tts/generic) and
 the default health path. The command and env come straight from the
 runtime config through template expansion — no hidden flags.
 """
@@ -10,6 +10,7 @@ from llm_proxy.drivers.utils import build_substitutions, render_command, render_
 
 DEFAULT_HEALTH_PATH = {
     "llm": "/health",
+    "embedding": "/health",
     "stt": "/health",
     "tts": "/health",
     "generic": "/health",
