@@ -147,7 +147,7 @@ def _validate_route(name, route):
         if not b.get("url"):
             raise ValueError(f"Route '{name}'.backends[{i}] requires 'url'")
     kind = route.get("kind", "llm")
-    if kind not in ("llm", "stt", "tts"):
+    if kind not in ("llm", "embedding", "stt", "tts"):
         raise ValueError(f"Route '{name}' has unknown kind: {kind}")
 
 

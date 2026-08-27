@@ -55,7 +55,24 @@ curl http://127.0.0.1:8090/v1/embeddings \
 
 `input` is forwarded unchanged. Validation of input types, token limits, and
 batch limits is left to the backend. Model resolution only considers embedding
-runtimes; chat, STT, and TTS runtimes cannot be selected through this endpoint.
+runtimes and routes; chat, STT, and TTS runtimes cannot be selected through
+this endpoint.
+
+An embedding backend can be exposed through the routing layer instead of being
+managed as a local runtime:
+
+```yaml
+routes:
+  bge-m3:
+    kind: embedding
+    backends:
+      - url: https://embedding-host:8080
+        model: bge-m3
+        auth: embedding-host
+```
+
+Routed embedding requests use the same health monitoring, authentication,
+TLS, statistics, and failover machinery as routed chat requests.
 
 Error statuses are:
 

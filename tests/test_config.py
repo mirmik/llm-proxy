@@ -75,6 +75,23 @@ class ConfigRuntimeTests(unittest.TestCase):
         self.assertFalse(config["statistics"]["include_host"])
         self.assertEqual(config["statistics"]["retention_days"], 30)
 
+    def test_embedding_route_is_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.yaml")
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.safe_dump({
+                    "routes": {
+                        "bge-m3": {
+                            "kind": "embedding",
+                            "backends": [{"url": "https://embedding-host:8080"}],
+                        },
+                    },
+                }, f)
+
+            config = load_config(path)
+
+        self.assertEqual(config["routes"]["bge-m3"]["kind"], "embedding")
+
 
 if __name__ == "__main__":
     unittest.main()

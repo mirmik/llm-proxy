@@ -12,12 +12,14 @@ from llm_proxy.config import load_config_file, save_config_file
 
 KIND_ENDPOINTS = {
     "llm": "/v1/chat/completions",
+    "embedding": "/v1/embeddings",
     "stt": "/stt",
     "tts": "/v1/audio/speech",
 }
 
 KIND_HEALTH_DEFAULTS = {
     "llm": "/health",
+    "embedding": "/health",
     "stt": "/health",
     "tts": "/health",
 }

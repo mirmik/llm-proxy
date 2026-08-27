@@ -2,7 +2,12 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from llm_proxy.route_manager import Route, RouteManager, backend_client_kwargs
+from llm_proxy.route_manager import (
+    Route,
+    RouteManager,
+    _derive_endpoint_url,
+    backend_client_kwargs,
+)
 
 
 class _DummyResponse:
@@ -29,6 +34,12 @@ class _DummyClientSession:
 
 
 class RouteSessionDispatchTests(unittest.IsolatedAsyncioTestCase):
+    def test_embedding_endpoint_is_openai_compatible(self):
+        self.assertEqual(
+            _derive_endpoint_url("https://host:8090", "embedding"),
+            "https://host:8090/v1/embeddings",
+        )
+
     async def test_tls_verify_false_disables_aiohttp_ssl_verification(self):
         kwargs = backend_client_kwargs({"url": "https://host:8090", "tls_verify": False})
         connector = kwargs.get("connector")

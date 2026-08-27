@@ -7,6 +7,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from llm_proxy.drivers import build_driver_registry
+from llm_proxy.route_manager import RouteManager
 from llm_proxy.router import _resolve_runtime_by_kind, create_api_app
 from llm_proxy.statistics import StatisticsStore
 
@@ -90,8 +91,13 @@ class EmbeddingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         app.router.add_post("/v1/embeddings", handler)
         return await self.start_app(app)
 
-    async def proxy(self, rm, auth=None):
-        app = create_api_app(rm, FakeSlotManager(), auth or FakeAuth())
+    async def proxy(self, rm, auth=None, routes=None):
+        app = create_api_app(
+            rm,
+            FakeSlotManager(),
+            auth or FakeAuth(),
+            route_manager=routes,
+        )
         app["statistics"] = self.store
         app["config"] = {"statistics": {"enabled": True, "include_host": False}}
         return await self.start_app(app)
@@ -177,6 +183,42 @@ class EmbeddingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 413)
         self.assertEqual((await response.json())["error"], "input is too large")
+
+    async def test_embedding_route_forwards_to_remote_backend(self):
+        received = []
+
+        async def embeddings(request):
+            body = await request.json()
+            received.append(body)
+            return web.json_response({
+                "object": "list",
+                "model": body["model"],
+                "data": [{"object": "embedding", "index": 0, "embedding": [1.0]}],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1},
+            })
+
+        backend = await self.backend(embeddings)
+        routes = RouteManager({
+            "routes": {
+                "bge-m3": {
+                    "kind": "embedding",
+                    "backends": [{
+                        "url": str(backend.make_url("/")).rstrip("/"),
+                        "model": "remote-bge",
+                    }],
+                },
+            },
+        })
+        proxy = await self.proxy(FakeRuntimeManager(), routes=routes)
+
+        response = await proxy.post(
+            "/v1/embeddings",
+            json={"model": "bge-m3", "input": "hello"},
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["model"], "remote-bge")
+        self.assertEqual(received, [{"model": "remote-bge", "input": "hello"}])
 
     async def test_invalid_requests_and_wrong_kind_are_rejected(self):
         rm = FakeRuntimeManager(embedding_names=["bge-m3"], chat_names=["chat-main"])

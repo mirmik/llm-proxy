@@ -340,10 +340,11 @@ def _resolve_runtime_by_kind(rm, model_name, kind):
 
 
 async def handle_embeddings(request):
-    """Proxy OpenAI-compatible embeddings to a local embedding runtime."""
+    """Proxy OpenAI-compatible embeddings to a routed or local runtime."""
     request_started = now()
     client = _require_client_auth(request)
     rm = request.app["rm"]
+    route_manager = request.app.get("routes")
     host = _client_host(request)
     raw_body = await request.read()
     trace = _new_trace(
@@ -369,6 +370,27 @@ async def handle_embeddings(request):
     requested_model = requested_model.strip()
     if trace is not None:
         trace.requested_model = requested_model
+
+    route = route_manager.get_route(requested_model) if route_manager else None
+    if route and route.kind == "embedding":
+        if trace is not None:
+            trace.route = route.name
+            trace.resolved_model = route.name
+        log_event(
+            "request received",
+            kind="embedding",
+            host=host,
+            model=requested_model,
+            route=route.name,
+        )
+        return await _proxy_routed(
+            request,
+            route,
+            body,
+            False,
+            request_started,
+            trace=trace,
+        )
 
     runtime_name, err = _resolve_runtime_by_kind(rm, requested_model, "embedding")
     if err:
@@ -1032,7 +1054,11 @@ async def handle_stt_proxy(request):
             route = route_manager.get_route(route_name)
             if trace is not None:
                 trace.route = route.name
-            from llm_proxy.route_manager import _derive_endpoint_url
+            from llm_proxy.route_manager import (
+                _derive_endpoint_url,
+                backend_client_kwargs,
+                backend_request_kwargs,
+            )
             candidates = route.failover_candidates()
             last_err = None
             for backend in candidates:
@@ -1056,10 +1082,13 @@ async def handle_stt_proxy(request):
                 ) if trace is not None else None
                 log_event("request forward", kind="stt", host=host, route=route.name, backend=_backend_label(url))
                 try:
-                    async with aiohttp.ClientSession() as sess:
+                    async with aiohttp.ClientSession(
+                        **backend_client_kwargs(backend)
+                    ) as sess:
                         async with sess.post(
                             url, data=body, headers=headers,
                             timeout=aiohttp.ClientTimeout(total=300),
+                            **backend_request_kwargs(backend),
                         ) as resp:
                             if resp.status >= 500:
                                 raw = await resp.read()
@@ -1235,7 +1264,11 @@ async def handle_tts_proxy(request):
         if route and route.kind == "tts":
             if trace is not None:
                 trace.route = route.name
-            from llm_proxy.route_manager import _derive_endpoint_url
+            from llm_proxy.route_manager import (
+                _derive_endpoint_url,
+                backend_client_kwargs,
+                backend_request_kwargs,
+            )
             candidates = route.failover_candidates()
             last_err = None
             for backend in candidates:
@@ -1251,9 +1284,12 @@ async def handle_tts_proxy(request):
                 ) if trace is not None else None
                 log_event("request forward", kind="tts", host=host, route=route.name, backend=_backend_label(url))
                 try:
-                    async with aiohttp.ClientSession() as sess:
+                    async with aiohttp.ClientSession(
+                        **backend_client_kwargs(backend)
+                    ) as sess:
                         async with sess.post(url, json=body, headers=headers,
-                                            timeout=aiohttp.ClientTimeout(total=300)) as backend_resp:
+                                            timeout=aiohttp.ClientTimeout(total=300),
+                                            **backend_request_kwargs(backend)) as backend_resp:
                             if backend_resp.status >= 500:
                                 raw = await backend_resp.read()
                                 if attempt is not None:
