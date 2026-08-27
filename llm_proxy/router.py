@@ -53,6 +53,22 @@ _STATISTICS_PERIODS = {
 }
 
 
+class _SSECompletionTracker:
+    """Recognize a complete OpenAI-compatible stream across chunk boundaries."""
+
+    def __init__(self):
+        self._tail = b""
+        self.done = False
+
+    def feed(self, chunk):
+        if self.done:
+            return
+        combined = self._tail + chunk
+        if b"data: [DONE]" in combined:
+            self.done = True
+        self._tail = combined[-32:]
+
+
 def _setup_app(rm, sm, auth, routes=None):
     max_size = int((getattr(rm, "config", {}) or {}).get("client_max_size", 64 * 1024 * 1024))
     app = web.Application(client_max_size=max_size)
@@ -582,27 +598,32 @@ async def handle_chat(request):
         stream=stream,
     )
 
+    proxy_op = {
+        "kind": "chat",
+        "host": host,
+        "model": model_name,
+        "runtime": model_name,
+        "backend": _backend_label(backend_url),
+        "started": request_started,
+        "trace": trace,
+        # Mutated by the local proxy helpers only after a clean 2xx backend
+        # completion.  It deliberately remains false for timeouts and client
+        # disconnects so the slot manager can roll back the working KV state.
+        "_local_request_success": False,
+    }
     try:
         if stream:
-            return await _proxy_stream(
-                request,
-                backend_url,
-                body,
-                op={"kind": "chat", "host": host, "model": model_name,
-                    "runtime": model_name, "backend": _backend_label(backend_url),
-                    "started": request_started, "trace": trace},
-            )
+            return await _proxy_stream(request, backend_url, body, op=proxy_op)
         else:
-            return await _proxy_json(
-                backend_url,
-                body,
-                op={"kind": "chat", "host": host, "model": model_name,
-                    "runtime": model_name, "backend": _backend_label(backend_url),
-                    "started": request_started, "trace": trace},
-            )
+            return await _proxy_json(backend_url, body, op=proxy_op)
     finally:
         if slot_id is not None:
-            await sm.release(model_name, slot_id)
+            await sm.finalize_request(
+                model_name,
+                port,
+                slot_id,
+                success=proxy_op["_local_request_success"],
+            )
 
 
 async def _proxy_routed(
@@ -787,6 +808,8 @@ async def _proxy_json(url, body, extra_headers=None, op=None):
                 if attempt is not None:
                     attempt.finish(resp.status, output_bytes=len(raw))
                 _log_proxy_done(op, resp.status, output_bytes=_json_size(data))
+                if op is not None and 200 <= resp.status < 300:
+                    op["_local_request_success"] = True
                 return web.json_response(data, status=resp.status)
     except Exception as e:
         if attempt is not None:
@@ -811,6 +834,7 @@ async def _proxy_stream(request, url, body, extra_headers=None, op=None):
     backend_bytes = 0
     client_bytes = 0
     usage_parser = _usage_parser(op)
+    completion = _SSECompletionTracker()
     try:
         timeout = aiohttp.ClientTimeout(total=300)
         async with aiohttp.ClientSession() as sess:
@@ -819,6 +843,7 @@ async def _proxy_stream(request, url, body, extra_headers=None, op=None):
                 status = backend.status
                 async for chunk in backend.content.iter_any():
                     backend_bytes += len(chunk)
+                    completion.feed(chunk)
                     if usage_parser is not None:
                         usage_parser.feed(chunk)
                     _note_first_output(op)
@@ -849,6 +874,8 @@ async def _proxy_stream(request, url, body, extra_headers=None, op=None):
         if attempt is not None:
             attempt.finish(status, output_bytes=backend_bytes)
         _log_proxy_done(op, status, output_bytes=client_bytes)
+        if op is not None and 200 <= status < 300 and completion.done:
+            op["_local_request_success"] = True
 
     try:
         await response.write_eof()

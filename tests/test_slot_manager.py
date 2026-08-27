@@ -12,15 +12,67 @@ class RecordingSlotManager(SlotManager):
         super().__init__()
         self.saved = []
         self.restored = []
+        self.erased = []
+        self.restore_succeeds = False
 
     async def _save(self, model_name, port, slot_id, session_id):
         self.saved.append((model_name, port, slot_id, session_id))
+        return True
 
     async def _restore(self, model_name, port, slot_id, session_id):
         self.restored.append((model_name, port, slot_id, session_id))
+        return self.restore_succeeds
+
+    async def _erase(self, model_name, port, slot_id, session_id):
+        self.erased.append((model_name, port, slot_id, session_id))
+        return True
 
 
 class SlotManagerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_successful_request_commits_before_releasing_slot(self):
+        sm = RecordingSlotManager()
+        sm.init_model("model", 1)
+        slot = await sm.acquire("model", "session-a", 8081)
+        sm.saved.clear()
+        sm.restored.clear()
+
+        waiter = asyncio.create_task(sm.acquire("model", "session-b", 8081))
+        await asyncio.sleep(0)
+        await sm.finalize_request("model", 8081, slot, success=True)
+        next_slot = await asyncio.wait_for(waiter, timeout=1)
+
+        self.assertEqual(sm.saved[0], ("model", 8081, 0, "session-a"))
+        self.assertIn(("model", 8081, 0, "session-b"), sm.restored)
+        await sm.release("model", next_slot)
+
+    async def test_failed_request_restores_checkpoint_before_releasing_slot(self):
+        sm = RecordingSlotManager()
+        sm.restore_succeeds = True
+        sm.init_model("model", 1)
+        slot = await sm.acquire("model", "session-a", 8081)
+        sm.restored.clear()
+
+        await sm.finalize_request("model", 8081, slot, success=False)
+
+        self.assertEqual(sm.saved, [])
+        self.assertEqual(sm.restored, [("model", 8081, 0, "session-a")])
+        self.assertEqual(sm.erased, [])
+        self.assertFalse(sm._slots["model"][slot]["busy"])
+
+    async def test_failed_first_request_erases_uncheckpointed_slot(self):
+        sm = RecordingSlotManager()
+        sm.restore_succeeds = False
+        sm.init_model("model", 1)
+        slot = await sm.acquire("model", "session-a", 8081)
+        sm.restored.clear()
+
+        await sm.finalize_request("model", 8081, slot, success=False)
+
+        self.assertEqual(sm.saved, [])
+        self.assertEqual(sm.restored, [("model", 8081, 0, "session-a")])
+        self.assertEqual(sm.erased, [("model", 8081, 0, "session-a")])
+        self.assertFalse(sm._slots["model"][slot]["busy"])
+
     async def test_same_session_waits_for_busy_slot(self):
         sm = RecordingSlotManager()
         sm.init_model("model", 1)

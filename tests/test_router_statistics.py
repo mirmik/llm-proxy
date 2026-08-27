@@ -37,6 +37,18 @@ class FakeSlotManager:
         return None
 
 
+class TrackingSlotManager(FakeSlotManager):
+    def __init__(self):
+        super().__init__()
+        self.finalized = []
+
+    async def acquire(self, model, session, port):
+        return 0
+
+    async def finalize_request(self, model, port, slot, *, success):
+        self.finalized.append((model, port, slot, success))
+
+
 class FakeRuntimeManager:
     def __init__(self, ports=None):
         self.ports = ports or {}
@@ -91,10 +103,10 @@ class RouterStatisticsTests(unittest.IsolatedAsyncioTestCase):
             app.router.add_route(method, path, handler)
         return await self.start_app(app)
 
-    async def proxy(self, rm, routes=None):
+    async def proxy(self, rm, routes=None, sm=None):
         app = create_api_app(
             rm,
-            FakeSlotManager(),
+            sm or FakeSlotManager(),
             FakeAuth(),
             route_manager=routes,
         )
@@ -164,6 +176,50 @@ class RouterStatisticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["usage_available"], 1)
         self.assertIsNotNone(row["ttft_ms"])
         self.assertEqual(row["client_output_bytes"], len(streamed))
+
+    async def test_complete_local_stream_commits_slot(self):
+        async def chat(request):
+            await request.json()
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n')
+            await response.write(b"data: [DO")
+            await response.write(b"NE]\n\n")
+            await response.write_eof()
+            return response
+
+        backend = await self.backend([("POST", "/v1/chat/completions", chat)])
+        sm = TrackingSlotManager()
+        proxy = await self.proxy(FakeRuntimeManager({"model": backend.server.port}), sm=sm)
+
+        response = await proxy.post(
+            "/v1/chat/completions",
+            json={"model": "model", "stream": True, "session_id": "session-a"},
+        )
+        await response.read()
+
+        self.assertEqual(sm.finalized, [("model", backend.server.port, 0, True)])
+
+    async def test_incomplete_local_stream_rolls_back_slot(self):
+        async def chat(request):
+            await request.json()
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n')
+            await response.write_eof()
+            return response
+
+        backend = await self.backend([("POST", "/v1/chat/completions", chat)])
+        sm = TrackingSlotManager()
+        proxy = await self.proxy(FakeRuntimeManager({"model": backend.server.port}), sm=sm)
+
+        response = await proxy.post(
+            "/v1/chat/completions",
+            json={"model": "model", "stream": True, "session_id": "session-a"},
+        )
+        await response.read()
+
+        self.assertEqual(sm.finalized, [("model", backend.server.port, 0, False)])
 
     async def test_routed_failover_is_one_request_with_two_attempts(self):
         async def fail(request):

@@ -15,7 +15,7 @@ class SlotManager:
     """Manages slot ↔ session mapping with LRU eviction and KV cache persistence."""
 
     def __init__(self, cache_dir=None):
-        # model_name → {slot_id: {"session": str|None, "last_used": float, "busy": bool}}
+        # model_name → {slot_id: {session, last_used, busy, checkpointed}}
         self._slots = {}
         self._conditions = {}
         # Models where save/restore is known to be unsupported
@@ -26,7 +26,12 @@ class SlotManager:
         """Register slots for a newly started model."""
         self._ensure_runtime_cache_dir(model_name)
         self._slots[model_name] = {
-            i: {"session": None, "last_used": 0, "busy": False}
+            i: {
+                "session": None,
+                "last_used": 0,
+                "busy": False,
+                "checkpointed": False,
+            }
             for i in range(num_slots)
         }
         self._conditions[model_name] = asyncio.Condition()
@@ -113,7 +118,11 @@ class SlotManager:
                         info["session"] = session_id
                         info["last_used"] = time.time()
                         if not transient:
-                            await self._restore(model_name, port, slot_id, session_id)
+                            info["checkpointed"] = await self._restore(
+                                model_name, port, slot_id, session_id
+                            )
+                        else:
+                            info["checkpointed"] = False
                         log_event(
                             "slot acquire",
                             model=model_name,
@@ -135,11 +144,17 @@ class SlotManager:
                 old_session = info["session"]
                 info["busy"] = True
 
-                if old_session:
-                    await self._save(model_name, port, lru_slot, old_session)
+                if old_session and not info["checkpointed"]:
+                    info["checkpointed"] = await self._save(
+                        model_name, port, lru_slot, old_session
+                    )
 
                 if not transient:
-                    await self._restore(model_name, port, lru_slot, session_id)
+                    info["checkpointed"] = await self._restore(
+                        model_name, port, lru_slot, session_id
+                    )
+                else:
+                    info["checkpointed"] = False
                 info["session"] = session_id
                 info["last_used"] = time.time()
                 log_event(
@@ -170,6 +185,33 @@ class SlotManager:
             condition.notify_all()
             log_event("slot release", model=model_name, slot=slot_id, ms=elapsed_ms(started))
 
+    async def finalize_request(self, model_name, port, slot_id, *, success):
+        """Commit or roll back one request, then release its slot lease.
+
+        llama-server mutates a slot while evaluating a request.  A failed or
+        disconnected request must not become the persisted state for the
+        session: the next request may contain a different prompt and would
+        otherwise have to repair a partially advanced KV cache.  Successful
+        requests are checkpointed immediately; failed requests restore that
+        checkpoint (or erase a slot that has never had one).
+        """
+        slots = self._slots.get(model_name)
+        info = slots.get(slot_id) if slots else None
+        session_id = info.get("session") if info else None
+
+        if session_id is not None and model_name not in self._no_persistence:
+            if success:
+                info["checkpointed"] = await self._save(
+                    model_name, port, slot_id, session_id
+                )
+            else:
+                restored = await self._restore(model_name, port, slot_id, session_id)
+                if not restored:
+                    await self._erase(model_name, port, slot_id, session_id)
+                info["checkpointed"] = restored
+
+        await self.release(model_name, slot_id)
+
     async def save_all(self, model_name, port):
         """Save all active slots for a model (before stopping)."""
         if model_name in self._no_persistence:
@@ -185,14 +227,16 @@ class SlotManager:
             saved = 0
             for slot_id, info in slots.items():
                 if info["session"]:
-                    await self._save(model_name, port, slot_id, info["session"])
+                    info["checkpointed"] = await self._save(
+                        model_name, port, slot_id, info["session"]
+                    )
                     saved += 1
             log_event("slots save-all", model=model_name, count=saved, ms=elapsed_ms(started))
 
     async def _save(self, model_name, port, slot_id, session_id):
         """Save slot KV cache to disk via llama-server API."""
         if model_name in self._no_persistence:
-            return
+            return False
         self._ensure_runtime_cache_dir(model_name)
         started = now()
         url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=save"
@@ -211,6 +255,7 @@ class SlotManager:
                             ms=elapsed_ms(started),
                             file=filename,
                         )
+                        return True
                     elif resp.status == 400:
                         text = await resp.text()
                         unsupported = _looks_persistence_unsupported(text)
@@ -248,11 +293,12 @@ class SlotManager:
                 file=filename,
                 error=e,
             )
+        return False
 
     async def _restore(self, model_name, port, slot_id, session_id):
         """Restore slot KV cache from disk. Silently skips if unsupported or no saved state."""
         if model_name in self._no_persistence:
-            return
+            return False
         self._ensure_runtime_cache_dir(model_name)
         started = now()
         url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=restore"
@@ -271,6 +317,7 @@ class SlotManager:
                             ms=elapsed_ms(started),
                             file=filename,
                         )
+                        return True
                     elif resp.status == 400:
                         text = await resp.text()
                         log_event(
@@ -306,6 +353,45 @@ class SlotManager:
                 file=filename,
                 error=e,
             )
+        return False
+
+    async def _erase(self, model_name, port, slot_id, session_id):
+        """Erase an uncommitted slot when no checkpoint can be restored."""
+        started = now()
+        url = f"http://127.0.0.1:{port}/slots/{slot_id}?action=erase"
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 200:
+                        log_event(
+                            "slot rollback erase",
+                            model=model_name,
+                            session=_session_label(session_id),
+                            slot=slot_id,
+                            status=resp.status,
+                            ms=elapsed_ms(started),
+                        )
+                        return True
+                    text = await resp.text()
+                    log_event(
+                        "slot rollback erase failed",
+                        model=model_name,
+                        session=_session_label(session_id),
+                        slot=slot_id,
+                        status=resp.status,
+                        ms=elapsed_ms(started),
+                        error=_short_error(text),
+                    )
+        except Exception as e:
+            log_event(
+                "slot rollback erase error",
+                model=model_name,
+                session=_session_label(session_id),
+                slot=slot_id,
+                ms=elapsed_ms(started),
+                error=e,
+            )
+        return False
 
     def _ensure_runtime_cache_dir(self, model_name):
         if self.cache_dir is None:
