@@ -243,6 +243,52 @@ class RouterStatisticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["client_input_bytes"], len(b"audio-bytes"))
         self.assertEqual(row["client_output_bytes"], len(response_body))
 
+    async def test_named_stt_route_is_selected_by_runtime_header(self):
+        received = []
+
+        async def stt(request):
+            received.append(await request.read())
+            return web.json_response({"text": "routed"})
+
+        backend = await self.backend([("POST", "/stt", stt)])
+        config = {"routes": {"stt-gigaam": {"kind": "stt", "backends": [
+            {"url": str(backend.make_url("/")).rstrip("/")},
+        ]}}}
+        proxy = await self.proxy(FakeRuntimeManager(), RouteManager(config))
+
+        response = await proxy.post(
+            "/stt",
+            data=b"float32-audio",
+            headers={"X-STT-Runtime": "stt-gigaam"},
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["text"], "routed")
+        self.assertEqual(received, [b"float32-audio"])
+
+    async def test_named_stt_route_health_is_forwarded(self):
+        async def health(request):
+            return web.json_response({"status": "ok", "worker": "remote"})
+
+        backend = await self.backend([("GET", "/health", health)])
+        config = {"routes": {"stt-gigaam": {"kind": "stt", "backends": [
+            {"url": str(backend.make_url("/")).rstrip("/")},
+        ]}}}
+        proxy = await self.proxy(FakeRuntimeManager(), RouteManager(config))
+
+        response = await proxy.get(
+            "/stt/health",
+            headers={"X-STT-Runtime": "stt-gigaam"},
+        )
+        body = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["worker"], "remote")
+        self.assertEqual(body["runtime"], "stt-gigaam")
+        self.assertEqual(body["route"], "stt-gigaam")
+        self.assertTrue(body["loaded"])
+
     async def test_local_tts_counts_streamed_audio(self):
         async def tts(request):
             await request.json()

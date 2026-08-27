@@ -1028,6 +1028,20 @@ def _resolve_stt_runtime(rm, requested=None):
     )
 
 
+def _resolve_stt_route(route_manager, requested=None):
+    """Resolve an STT route without mistaking its name for a local runtime."""
+    if route_manager is None:
+        return None
+    if requested:
+        route = route_manager.get_route(requested)
+        return route if route and route.kind == "stt" else None
+    for name in route_manager.available_routes():
+        route = route_manager.get_route(name)
+        if route.kind == "stt":
+            return route
+    return None
+
+
 async def handle_stt_proxy(request):
     """Proxy STT client traffic to the active STT runtime or route."""
     request_started = now()
@@ -1046,91 +1060,87 @@ async def handle_stt_proxy(request):
     )
     log_event("request received", kind="stt", host=host, runtime=requested_runtime)
 
-    if route_manager and not requested_runtime:
-        stt_routes = [n for n in route_manager.available_routes()
-                      if route_manager.get_route(n).kind == "stt"]
-        if stt_routes:
-            route_name = stt_routes[0]
-            route = route_manager.get_route(route_name)
-            if trace is not None:
-                trace.route = route.name
-            from llm_proxy.route_manager import (
-                _derive_endpoint_url,
-                backend_client_kwargs,
-                backend_request_kwargs,
-            )
-            candidates = route.failover_candidates()
-            last_err = None
-            for backend in candidates:
-                url = _derive_endpoint_url(backend["url"], "stt")
-                headers = route._auth_headers(backend)
-                if request.content_type:
-                    headers["Content-Type"] = request.headers.get("Content-Type", request.content_type)
-                prompt = request.headers.get("X-Initial-Prompt")
-                if prompt:
-                    headers["X-Initial-Prompt"] = prompt
-                query_string = request.query_string
-                if query_string:
-                    url += "?" + query_string
-                route.note_request_start(None, backend["url"])
-                attempt = trace.start_attempt(
-                    model=backend.get("model", route.name),
-                    route=route.name,
-                    backend=_backend_label(url),
-                    route_reason=backend.get("_route_reason"),
-                    input_bytes=len(body),
-                ) if trace is not None else None
-                log_event("request forward", kind="stt", host=host, route=route.name, backend=_backend_label(url))
-                try:
-                    async with aiohttp.ClientSession(
-                        **backend_client_kwargs(backend)
-                    ) as sess:
-                        async with sess.post(
-                            url, data=body, headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=300),
-                            **backend_request_kwargs(backend),
-                        ) as resp:
-                            if resp.status >= 500:
-                                raw = await resp.read()
-                                if attempt is not None:
-                                    attempt.finish(resp.status, error=RuntimeError(), output_bytes=len(raw))
-                                raise aiohttp.ClientResponseError(
-                                    resp.request_info, resp.history, status=resp.status,
-                                    message=f"HTTP {resp.status}",
-                                    headers=resp.headers,
-                                )
+    route = _resolve_stt_route(route_manager, requested_runtime)
+    if route:
+        if trace is not None:
+            trace.route = route.name
+        from llm_proxy.route_manager import (
+            _derive_endpoint_url,
+            backend_client_kwargs,
+            backend_request_kwargs,
+        )
+        candidates = route.failover_candidates()
+        last_err = None
+        for backend in candidates:
+            url = _derive_endpoint_url(backend["url"], "stt")
+            headers = route._auth_headers(backend)
+            if request.content_type:
+                headers["Content-Type"] = request.headers.get("Content-Type", request.content_type)
+            prompt = request.headers.get("X-Initial-Prompt")
+            if prompt:
+                headers["X-Initial-Prompt"] = prompt
+            query_string = request.query_string
+            if query_string:
+                url += "?" + query_string
+            route.note_request_start(None, backend["url"])
+            attempt = trace.start_attempt(
+                model=backend.get("model", route.name),
+                route=route.name,
+                backend=_backend_label(url),
+                route_reason=backend.get("_route_reason"),
+                input_bytes=len(body),
+            ) if trace is not None else None
+            log_event("request forward", kind="stt", host=host, route=route.name, backend=_backend_label(url))
+            try:
+                async with aiohttp.ClientSession(
+                    **backend_client_kwargs(backend)
+                ) as sess:
+                    async with sess.post(
+                        url, data=body, headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=300),
+                        **backend_request_kwargs(backend),
+                    ) as resp:
+                        if resp.status >= 500:
                             raw = await resp.read()
                             if attempt is not None:
-                                attempt.finish(resp.status, output_bytes=len(raw))
-                            if trace is not None:
-                                trace.resolved_model = backend.get("model", route.name)
-                            content_type = resp.headers.get("Content-Type", "application/json")
-                            log_event(
-                                "request complete",
-                                kind="stt",
-                                host=host,
-                                route=route.name,
-                                status=resp.status,
-                                ms=elapsed_ms(request_started),
+                                attempt.finish(resp.status, error=RuntimeError(), output_bytes=len(raw))
+                            raise aiohttp.ClientResponseError(
+                                resp.request_info, resp.history, status=resp.status,
+                                message=f"HTTP {resp.status}",
+                                headers=resp.headers,
                             )
-                            response = web.Response(body=raw, status=resp.status,
-                                                    content_type=content_type.split(";")[0])
-                            return _finish_trace(trace, response)
-                except Exception as e:
-                    if attempt is not None:
-                        attempt.finish(getattr(e, "status", 502), error=e)
-                    await route.mark_unhealthy(backend["url"])
-                    log_event("request backend failed", kind="stt", host=host, route=route.name, backend=_backend_label(url), error=e)
-                    last_err = str(e)
-                    continue
-                finally:
-                    route.note_request_end(None, backend["url"])
-            log_event("request failed", kind="stt", host=host, route=route.name, ms=elapsed_ms(request_started))
-            response = web.json_response(
-                {"error": f"All STT backends failed. Last error: {last_err}"},
-                status=503,
-            )
-            return _finish_trace(trace, response, error="all-backends-failed")
+                        raw = await resp.read()
+                        if attempt is not None:
+                            attempt.finish(resp.status, output_bytes=len(raw))
+                        if trace is not None:
+                            trace.resolved_model = backend.get("model", route.name)
+                        content_type = resp.headers.get("Content-Type", "application/json")
+                        log_event(
+                            "request complete",
+                            kind="stt",
+                            host=host,
+                            route=route.name,
+                            status=resp.status,
+                            ms=elapsed_ms(request_started),
+                        )
+                        response = web.Response(body=raw, status=resp.status,
+                                                content_type=content_type.split(";")[0])
+                        return _finish_trace(trace, response)
+            except Exception as e:
+                if attempt is not None:
+                    attempt.finish(getattr(e, "status", 502), error=e)
+                await route.mark_unhealthy(backend["url"])
+                log_event("request backend failed", kind="stt", host=host, route=route.name, backend=_backend_label(url), error=e)
+                last_err = str(e)
+                continue
+            finally:
+                route.note_request_end(None, backend["url"])
+        log_event("request failed", kind="stt", host=host, route=route.name, ms=elapsed_ms(request_started))
+        response = web.json_response(
+            {"error": f"All STT backends failed. Last error: {last_err}"},
+            status=503,
+        )
+        return _finish_trace(trace, response, error="all-backends-failed")
 
     runtime_name, err = _resolve_stt_runtime(rm, requested=requested_runtime)
     if err:
@@ -1459,10 +1469,61 @@ async def handle_tts_health(request):
 
 
 async def handle_stt_health(request):
-    """Expose STT runtime health through the proxy."""
+    """Expose STT runtime or routed-backend health through the proxy."""
     _require_client_auth(request)
     rm = request.app["rm"]
+    route_manager = request.app.get("routes")
     requested_runtime = request.headers.get(_STT_RUNTIME_HEADER, "").strip() or None
+    route = _resolve_stt_route(route_manager, requested_runtime)
+    if route:
+        from llm_proxy.route_manager import (
+            _derive_health_url,
+            backend_client_kwargs,
+            backend_request_kwargs,
+        )
+
+        last_err = None
+        for backend in route.failover_candidates():
+            url = _derive_health_url(backend["url"], route.health_path)
+            headers = route._auth_headers(backend)
+            try:
+                async with aiohttp.ClientSession(
+                    **backend_client_kwargs(backend)
+                ) as sess:
+                    async with sess.get(
+                        url,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=route.health_timeout),
+                        **backend_request_kwargs(backend),
+                    ) as resp:
+                        raw = await resp.read()
+                        if resp.status >= 500:
+                            raise aiohttp.ClientResponseError(
+                                resp.request_info,
+                                resp.history,
+                                status=resp.status,
+                                message=f"HTTP {resp.status}",
+                                headers=resp.headers,
+                            )
+                        try:
+                            data = json.loads(raw)
+                        except (TypeError, ValueError):
+                            data = {"status": "ok" if resp.status < 400 else "error"}
+                        if not isinstance(data, dict):
+                            data = {"status": "ok", "backend": data}
+                        data["runtime"] = route.name
+                        data["route"] = route.name
+                        data["loaded"] = resp.status < 400
+                        return web.json_response(data, status=resp.status)
+            except Exception as e:
+                await route.mark_unhealthy(backend["url"])
+                last_err = str(e)
+        return web.json_response(
+            {"error": f"All STT route backends failed. Last error: {last_err}",
+             "runtime": route.name, "route": route.name, "loaded": False},
+            status=503,
+        )
+
     runtime_name, err = _resolve_stt_runtime(rm, requested=requested_runtime)
     if err:
         return err
