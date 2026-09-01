@@ -8,6 +8,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from llm_proxy.route_manager import RouteManager
 from llm_proxy.router import create_api_app, create_control_app
 from llm_proxy.statistics import StatisticsStore
+from llm_proxy.stt_protocol import decode_initial_prompt
 
 
 class FakeAuth:
@@ -298,6 +299,29 @@ class RouterStatisticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["kind"], "stt")
         self.assertEqual(row["client_input_bytes"], len(b"audio-bytes"))
         self.assertEqual(row["client_output_bytes"], len(response_body))
+
+    async def test_local_stt_forwards_unicode_prompt_to_runtime(self):
+        received_prompts = []
+
+        async def stt(request):
+            received_prompts.append(decode_initial_prompt(request.headers))
+            return web.json_response({"text": "hello"})
+
+        backend = await self.backend([("POST", "/stt", stt)])
+        proxy = await self.proxy(FakeRuntimeManager({"stt-main": backend.server.port}))
+
+        response = await proxy.post(
+            "/stt",
+            data=b"audio-bytes",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Initial-Prompt-Encoded":
+                    "v1:0JDQstCw0LvQvtC9IOKAlCDQs9C+0LvQvtGB0L7QstC+0Lkg0LDRgdGB0LjRgdGC0LXQvdGC",
+            },
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(received_prompts, ["Авалон — голосовой ассистент"])
 
     async def test_named_stt_route_is_selected_by_runtime_header(self):
         received = []

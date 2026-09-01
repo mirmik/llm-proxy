@@ -20,6 +20,8 @@ import numpy as np
 from aiohttp import web
 from faster_whisper import WhisperModel
 
+from llm_proxy.stt_protocol import InitialPromptEncodingError, decode_initial_prompt
+
 
 def _env_or(name, default=None):
     value = os.environ.get(name)
@@ -64,7 +66,11 @@ def build_app(args, model):
         if duration < 0.3:
             return web.json_response({"text": "", "duration": duration})
 
-        prompt = request.query.get("prompt", "") or request.headers.get("X-Initial-Prompt", "")
+        try:
+            header_prompt = decode_initial_prompt(request.headers)
+        except InitialPromptEncodingError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        prompt = request.query.get("prompt", "") or header_prompt or ""
         segments, info = model.transcribe(
             audio,
             language=args.language,

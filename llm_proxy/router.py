@@ -11,6 +11,7 @@ from llm_proxy.certs import certificate_fingerprint, generate_server_cert
 from llm_proxy.config import load_config_file, save_config_file
 from llm_proxy.oplog import elapsed_ms, log_event, now
 from llm_proxy.statistics import RequestTrace, SSEUsageParser, apply_usage
+from llm_proxy.stt_protocol import forward_initial_prompt_headers
 
 _SESSION_BODY_KEYS = (
     "session_id",
@@ -1103,9 +1104,7 @@ async def handle_stt_proxy(request):
             headers = route._auth_headers(backend)
             if request.content_type:
                 headers["Content-Type"] = request.headers.get("Content-Type", request.content_type)
-            prompt = request.headers.get("X-Initial-Prompt")
-            if prompt:
-                headers["X-Initial-Prompt"] = prompt
+            forward_initial_prompt_headers(request.headers, headers)
             query_string = request.query_string
             if query_string:
                 url += "?" + query_string
@@ -1213,9 +1212,7 @@ async def handle_stt_proxy(request):
     auth_header = request.headers.get("Authorization")
     if auth_header:
         headers["Authorization"] = auth_header
-    prompt = request.headers.get("X-Initial-Prompt")
-    if prompt:
-        headers["X-Initial-Prompt"] = prompt
+    forward_initial_prompt_headers(request.headers, headers)
 
     query_string = request.query_string
     if query_string:
