@@ -15,7 +15,8 @@ class SlotManager:
     """Manages slot ↔ session mapping with LRU eviction and KV cache persistence."""
 
     def __init__(self, cache_dir=None):
-        # model_name → {slot_id: {session, last_used, busy, checkpointed}}
+        # model_name → {slot_id: {session, last_used, busy,
+        #                            checkpointed, live_dirty}}
         self._slots = {}
         self._conditions = {}
         # Models where save/restore is known to be unsupported
@@ -31,6 +32,11 @@ class SlotManager:
                 "last_used": 0,
                 "busy": False,
                 "checkpointed": False,
+                # The live llama-server slot contains work from a request that
+                # did not complete.  Keep it in memory so llama-server can use
+                # its prompt checkpoints to reconcile the next prompt, but do
+                # not persist it over the last committed disk checkpoint.
+                "live_dirty": False,
             }
             for i in range(num_slots)
         }
@@ -123,6 +129,7 @@ class SlotManager:
                             )
                         else:
                             info["checkpointed"] = False
+                        info["live_dirty"] = False
                         log_event(
                             "slot acquire",
                             model=model_name,
@@ -144,7 +151,19 @@ class SlotManager:
                 old_session = info["session"]
                 info["busy"] = True
 
-                if old_session and not info["checkpointed"]:
+                if old_session and info["live_dirty"]:
+                    log_event(
+                        "slot discard dirty live state",
+                        model=model_name,
+                        session=_session_label(old_session),
+                        slot=lru_slot,
+                        checkpointed=info["checkpointed"],
+                    )
+                if (
+                    old_session
+                    and not info["checkpointed"]
+                    and not info["live_dirty"]
+                ):
                     info["checkpointed"] = await self._save(
                         model_name, port, lru_slot, old_session
                     )
@@ -155,6 +174,7 @@ class SlotManager:
                     )
                 else:
                     info["checkpointed"] = False
+                info["live_dirty"] = False
                 info["session"] = session_id
                 info["last_used"] = time.time()
                 log_event(
@@ -186,14 +206,20 @@ class SlotManager:
             log_event("slot release", model=model_name, slot=slot_id, ms=elapsed_ms(started))
 
     async def finalize_request(self, model_name, port, slot_id, *, success):
-        """Commit or roll back one request, then release its slot lease.
+        """Commit one request or retain its live recovery state, then release.
 
         llama-server mutates a slot while evaluating a request.  A failed or
         disconnected request must not become the persisted state for the
-        session: the next request may contain a different prompt and would
-        otherwise have to repair a partially advanced KV cache.  Successful
-        requests are checkpointed immediately; failed requests restore that
-        checkpoint (or erase a slot that has never had one).
+        session.  It must remain in the live slot, however: SWA and
+        hybrid/recurrent runtimes keep rewind checkpoints only in memory.  A
+        disk restore contains tokens and the terminal sequence state but not
+        those checkpoints, so restoring here can force the next request to
+        reprocess the entire prompt.
+
+        Successful requests replace the committed disk checkpoint.  Failed
+        requests mark only the live slot dirty; eviction and shutdown then
+        preserve the previous committed checkpoint instead of saving the
+        unfinished state over it.
         """
         slots = self._slots.get(model_name)
         info = slots.get(slot_id) if slots else None
@@ -204,11 +230,16 @@ class SlotManager:
                 info["checkpointed"] = await self._save(
                     model_name, port, slot_id, session_id
                 )
+                info["live_dirty"] = False
             else:
-                restored = await self._restore(model_name, port, slot_id, session_id)
-                if not restored:
-                    await self._erase(model_name, port, slot_id, session_id)
-                info["checkpointed"] = restored
+                info["live_dirty"] = True
+                log_event(
+                    "slot retain dirty live state",
+                    model=model_name,
+                    session=_session_label(session_id),
+                    slot=slot_id,
+                    checkpointed=info["checkpointed"],
+                )
 
         await self.release(model_name, slot_id)
 
@@ -226,7 +257,15 @@ class SlotManager:
                 await condition.wait()
             saved = 0
             for slot_id, info in slots.items():
-                if info["session"]:
+                if info["session"] and info["live_dirty"]:
+                    log_event(
+                        "slot save-all skip dirty",
+                        model=model_name,
+                        session=_session_label(info["session"]),
+                        slot=slot_id,
+                        checkpointed=info["checkpointed"],
+                    )
+                if info["session"] and not info["live_dirty"]:
                     info["checkpointed"] = await self._save(
                         model_name, port, slot_id, info["session"]
                     )

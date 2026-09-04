@@ -5,6 +5,9 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/llm-proxy
+# Let the proxy persist slot state before it terminates its llama-server children.
+# Any children left after the graceful timeout are still killed as a group.
+KillMode=mixed
 TimeoutStopSec=15
 Restart=on-failure
 RestartSec=5
