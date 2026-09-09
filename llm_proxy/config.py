@@ -47,6 +47,8 @@ DEFAULT_CONFIG = {
         "max_total_gb": None,
         "max_per_runtime_gb": None,
         "keep_active_sessions": True,
+        "checkpoint_interval_minutes": 5,
+        "checkpoint_max_requests": 5,
     },
 }
 
@@ -97,6 +99,7 @@ def load_config(path=None):
         _validate_route(name, route)
 
     _validate_statistics(config.get("statistics") or {})
+    _validate_kv_cache(config.get("kv_cache") or {})
 
     return config
 
@@ -163,6 +166,28 @@ def _validate_statistics(statistics):
         raise ValueError("statistics.cleanup_interval_hours must be > 0")
     if statistics.get("client_identity", "token") not in ("token", "none"):
         raise ValueError("statistics.client_identity must be 'token' or 'none'")
+
+
+def _validate_kv_cache(kv_cache):
+    interval = kv_cache.get("checkpoint_interval_minutes", 5)
+    if interval is not None:
+        try:
+            interval = float(interval)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("kv_cache.checkpoint_interval_minutes must be a number or null") from exc
+        if interval < 0:
+            raise ValueError("kv_cache.checkpoint_interval_minutes must be >= 0")
+
+    max_requests = kv_cache.get("checkpoint_max_requests", 5)
+    if max_requests is not None:
+        if isinstance(max_requests, bool):
+            raise ValueError("kv_cache.checkpoint_max_requests must be a positive integer or null")
+        try:
+            parsed_number = float(max_requests)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("kv_cache.checkpoint_max_requests must be a positive integer or null") from exc
+        if not parsed_number.is_integer() or parsed_number < 1:
+            raise ValueError("kv_cache.checkpoint_max_requests must be a positive integer or null")
 
 
 def _normalize_runtime(runtime):

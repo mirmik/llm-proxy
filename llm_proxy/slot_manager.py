@@ -14,14 +14,27 @@ from llm_proxy.oplog import elapsed_ms, log_event, now
 class SlotManager:
     """Manages slot ↔ session mapping with LRU eviction and KV cache persistence."""
 
-    def __init__(self, cache_dir=None):
+    def __init__(self, cache_dir=None, *, checkpoint_interval_minutes=5,
+                 checkpoint_max_requests=5):
         # model_name → {slot_id: {session, last_used, busy,
-        #                            checkpointed, live_dirty}}
+        #                            checkpointed, has_checkpoint,
+        #                            requests_since_checkpoint,
+        #                            last_checkpoint_at, live_dirty}}
         self._slots = {}
         self._conditions = {}
         # Models where save/restore is known to be unsupported
         self._no_persistence = set()
         self.cache_dir = Path(cache_dir).expanduser() if cache_dir else None
+        self.checkpoint_interval_seconds = (
+            None
+            if checkpoint_interval_minutes is None
+            else float(checkpoint_interval_minutes) * 60.0
+        )
+        self.checkpoint_max_requests = (
+            None
+            if checkpoint_max_requests is None
+            else int(checkpoint_max_requests)
+        )
 
     def init_model(self, model_name, num_slots):
         """Register slots for a newly started model."""
@@ -31,7 +44,12 @@ class SlotManager:
                 "session": None,
                 "last_used": 0,
                 "busy": False,
+                # True only while the live slot exactly matches its latest
+                # durable checkpoint. A throttled successful request clears it.
                 "checkpointed": False,
+                "has_checkpoint": False,
+                "requests_since_checkpoint": 0,
+                "last_checkpoint_at": None,
                 # The live llama-server slot contains work from a request that
                 # did not complete.  Keep it in memory so llama-server can use
                 # its prompt checkpoints to reconcile the next prompt, but do
@@ -124,11 +142,12 @@ class SlotManager:
                         info["session"] = session_id
                         info["last_used"] = time.time()
                         if not transient:
-                            info["checkpointed"] = await self._restore(
+                            restored = await self._restore(
                                 model_name, port, slot_id, session_id
                             )
+                            self._record_restore(info, restored)
                         else:
-                            info["checkpointed"] = False
+                            self._reset_checkpoint_state(info)
                         info["live_dirty"] = False
                         log_event(
                             "slot acquire",
@@ -164,16 +183,16 @@ class SlotManager:
                     and not info["checkpointed"]
                     and not info["live_dirty"]
                 ):
-                    info["checkpointed"] = await self._save(
+                    await self._checkpoint(
                         model_name, port, lru_slot, old_session
                     )
 
+                self._reset_checkpoint_state(info)
                 if not transient:
-                    info["checkpointed"] = await self._restore(
+                    restored = await self._restore(
                         model_name, port, lru_slot, session_id
                     )
-                else:
-                    info["checkpointed"] = False
+                    self._record_restore(info, restored)
                 info["live_dirty"] = False
                 info["session"] = session_id
                 info["last_used"] = time.time()
@@ -216,10 +235,11 @@ class SlotManager:
         those checkpoints, so restoring here can force the next request to
         reprocess the entire prompt.
 
-        Successful requests replace the committed disk checkpoint.  Failed
-        requests mark only the live slot dirty; eviction and shutdown then
-        preserve the previous committed checkpoint instead of saving the
-        unfinished state over it.
+        Successful requests become eligible for a throttled disk checkpoint.
+        The first clean state is persisted immediately; later states are saved
+        when either the time or request-count limit is reached. Failed requests
+        mark only the live slot dirty, so eviction and shutdown preserve the
+        previous committed checkpoint instead of saving unfinished state.
         """
         slots = self._slots.get(model_name)
         info = slots.get(slot_id) if slots else None
@@ -227,10 +247,32 @@ class SlotManager:
 
         if session_id is not None and model_name not in self._no_persistence:
             if success:
-                info["checkpointed"] = await self._save(
-                    model_name, port, slot_id, session_id
-                )
                 info["live_dirty"] = False
+                info["checkpointed"] = False
+                info["requests_since_checkpoint"] += 1
+                reason = self._checkpoint_reason(info)
+                if reason is not None:
+                    log_event(
+                        "slot checkpoint due",
+                        model=model_name,
+                        session=_session_label(session_id),
+                        slot=slot_id,
+                        requests=info["requests_since_checkpoint"],
+                        reason=reason,
+                    )
+                    await self._checkpoint(
+                        model_name, port, slot_id, session_id
+                    )
+                else:
+                    age = time.monotonic() - info["last_checkpoint_at"]
+                    log_event(
+                        "slot checkpoint deferred",
+                        model=model_name,
+                        session=_session_label(session_id),
+                        slot=slot_id,
+                        requests=info["requests_since_checkpoint"],
+                        age_s=round(age, 1),
+                    )
             else:
                 info["live_dirty"] = True
                 log_event(
@@ -265,11 +307,15 @@ class SlotManager:
                         slot=slot_id,
                         checkpointed=info["checkpointed"],
                     )
-                if info["session"] and not info["live_dirty"]:
-                    info["checkpointed"] = await self._save(
+                if (
+                    info["session"]
+                    and not info["live_dirty"]
+                    and not info["checkpointed"]
+                ):
+                    if await self._checkpoint(
                         model_name, port, slot_id, info["session"]
-                    )
-                    saved += 1
+                    ):
+                        saved += 1
             log_event("slots save-all", model=model_name, count=saved, ms=elapsed_ms(started))
 
     async def _save(self, model_name, port, slot_id, session_id):
@@ -285,6 +331,7 @@ class SlotManager:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 200:
+                        payload = await _json_or_empty(resp)
                         log_event(
                             "slot save",
                             model=model_name,
@@ -293,6 +340,8 @@ class SlotManager:
                             status=resp.status,
                             ms=elapsed_ms(started),
                             file=filename,
+                            tokens=payload.get("n_saved"),
+                            bytes=payload.get("n_written"),
                         )
                         return True
                     elif resp.status == 400:
@@ -347,6 +396,7 @@ class SlotManager:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(url, json=body, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 200:
+                        payload = await _json_or_empty(resp)
                         log_event(
                             "slot restore",
                             model=model_name,
@@ -355,6 +405,8 @@ class SlotManager:
                             status=resp.status,
                             ms=elapsed_ms(started),
                             file=filename,
+                            tokens=payload.get("n_restored"),
+                            bytes=payload.get("n_read"),
                         )
                         return True
                     elif resp.status == 400:
@@ -393,6 +445,50 @@ class SlotManager:
                 error=e,
             )
         return False
+
+    async def _checkpoint(self, model_name, port, slot_id, session_id):
+        info = self._slots.get(model_name, {}).get(slot_id)
+        saved = await self._save(model_name, port, slot_id, session_id)
+        if info is not None:
+            info["checkpointed"] = saved
+            if saved:
+                info["has_checkpoint"] = True
+                info["requests_since_checkpoint"] = 0
+                info["last_checkpoint_at"] = time.monotonic()
+        return saved
+
+    def _checkpoint_reason(self, info):
+        if not info["has_checkpoint"]:
+            return "initial"
+        if info["last_checkpoint_at"] is None:
+            return "restored"
+        if (
+            self.checkpoint_max_requests is not None
+            and info["requests_since_checkpoint"] >= self.checkpoint_max_requests
+        ):
+            return "requests"
+        if (
+            self.checkpoint_interval_seconds is not None
+            and time.monotonic() - info["last_checkpoint_at"]
+            >= self.checkpoint_interval_seconds
+        ):
+            return "interval"
+        return None
+
+    @staticmethod
+    def _reset_checkpoint_state(info):
+        info["checkpointed"] = False
+        info["has_checkpoint"] = False
+        info["requests_since_checkpoint"] = 0
+        info["last_checkpoint_at"] = None
+
+    @staticmethod
+    def _record_restore(info, restored):
+        info["checkpointed"] = restored
+        info["has_checkpoint"] = restored
+        info["requests_since_checkpoint"] = 0
+        # Force one fresh checkpoint after a restored session is advanced.
+        info["last_checkpoint_at"] = None
 
     async def _erase(self, model_name, port, slot_id, session_id):
         """Erase an uncommitted slot when no checkpoint can be restored."""
@@ -461,6 +557,14 @@ def _short_error(text, limit=120):
     if len(text) <= limit:
         return text
     return text[:limit] + "..."
+
+
+async def _json_or_empty(response):
+    try:
+        payload = await response.json(content_type=None)
+    except (AttributeError, TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _cache_filename(session_id):

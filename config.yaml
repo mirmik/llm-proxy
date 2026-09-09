@@ -5,6 +5,12 @@ listen:
 cache_dir: "~/.cache/llm-proxy/kv"
 state_dir: "~/.config/llm-proxy"
 
+kv_cache:
+  # Save the first successful state immediately, then checkpoint when either
+  # limit is reached. Pending clean state is always saved on eviction/stop.
+  checkpoint_interval_minutes: 5
+  checkpoint_max_requests: 5
+
 tls:
   enabled: false
   cert_file: "~/.config/llm-proxy/certs/server.crt"
