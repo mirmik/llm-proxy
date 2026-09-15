@@ -362,6 +362,75 @@ class RouterStatisticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["error"], "all-backends-failed")
         self.assertEqual([row["status"] for row in self.store.fetch_attempts()], [503, 503])
 
+    async def test_routed_stream_failure_after_output_does_not_fail_over(self):
+        release = asyncio.Event()
+        second_calls = []
+
+        async def broken(request):
+            await request.read()
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n')
+            await release.wait()
+            request.transport.close()
+            return response
+
+        async def second(request):
+            second_calls.append(True)
+            return web.json_response({})
+
+        first = await self.backend([("POST", "/v1/chat/completions", broken)])
+        fallback = await self.backend([("POST", "/v1/chat/completions", second)])
+        config = {"routes": {"r": {"kind": "llm", "backends": [
+            {"url": str(first.make_url("/")).rstrip("/"), "model": "a"},
+            {"url": str(fallback.make_url("/")).rstrip("/"), "model": "b"},
+        ]}}}
+        proxy = await self.proxy(FakeRuntimeManager(), RouteManager(config))
+        response = await proxy.post("/v1/chat/completions", json={"model": "r", "stream": True})
+        self.assertIn(b"partial", await response.content.readuntil(b"\n\n"))
+        release.set()
+        self.assertIn(b"upstream_error", await response.read())
+        self.assertEqual(second_calls, [])
+        await self.store.flush()
+        self.assertEqual(self.store.fetch_requests()[0]["status"], 502)
+        self.assertEqual(self.store.fetch_requests()[0]["attempt_count"], 1)
+
+    async def test_routed_client_disconnect_does_not_mark_backend_unhealthy(self):
+        release = asyncio.Event()
+
+        async def chat(request):
+            await request.read()
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n')
+            await release.wait()
+            await response.write(b'data: {"choices":[{"delta":{"content":"second"}}]}\n\n')
+            return response
+
+        backend = await self.backend([("POST", "/v1/chat/completions", chat)])
+        url = str(backend.make_url("/")).rstrip("/")
+        routes = RouteManager({"routes": {"r": {"kind": "llm", "backends": [
+            {"url": url, "model": "a"},
+        ]}}})
+        proxy = await self.proxy(FakeRuntimeManager(), routes)
+        response = await proxy.post("/v1/chat/completions", json={"model": "r", "stream": True})
+        await response.content.readuntil(b"\n\n")
+        response.close()
+        # Let the server observe the FIN before it writes the next chunk.
+        await asyncio.sleep(0.05)
+        release.set()
+        for _ in range(100):
+            await self.store.flush()
+            rows = self.store.fetch_requests()
+            if rows:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(rows[0]["status"], 499)
+        self.assertNotEqual(rows[0]["error"], "all-backends-failed")
+        self.assertEqual(rows[0]["attempt_count"], 1)
+        self.assertEqual(routes.get_route("r").failover_candidates()[0]["url"], url)
+        self.assertIsNot(routes.get_route("r")._healthy[url], False)
+
     async def test_local_stt_counts_uploaded_and_returned_payload(self):
         async def stt(request):
             incoming = await request.read()

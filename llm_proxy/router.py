@@ -784,6 +784,17 @@ async def _proxy_json_inline(url, body, headers, backend=None, timeout=None, op=
         raise
 
 
+class _DownstreamDisconnected(ConnectionError):
+    """The caller left; retrying an upstream cannot repair this connection."""
+
+
+async def _client_stream_call(operation, *args):
+    try:
+        return await operation(*args)
+    except (aiohttp.ClientConnectionResetError, ConnectionResetError, BrokenPipeError):
+        raise _DownstreamDisconnected() from None
+
+
 async def _proxy_stream_inline(request, url, body, headers, backend=None, timeout=None, op=None):
     """Forward streaming request; raises on connection failure (enables failover)."""
     from llm_proxy.route_manager import backend_client_kwargs
@@ -797,6 +808,8 @@ async def _proxy_stream_inline(request, url, body, headers, backend=None, timeou
     backend_bytes = 0
     client_bytes = 0
     usage_parser = _usage_parser(op)
+    response = None
+    committed = False
     try:
         async with aiohttp.ClientSession(**backend_client_kwargs(backend or {})) as sess:
             async with sess.post(url, json=body, headers=headers, timeout=timeout) as backend_resp:
@@ -818,25 +831,54 @@ async def _proxy_stream_inline(request, url, body, headers, backend=None, timeou
                         "Cache-Control": "no-cache",
                     },
                 )
-                await response.prepare(request)
+                await _client_stream_call(response.prepare, request)
+                committed = True
                 async for chunk in backend_resp.content.iter_any():
                     backend_bytes += len(chunk)
                     if usage_parser is not None:
                         usage_parser.feed(chunk)
                     _note_first_output(op)
-                    await response.write(chunk)
+                    await _client_stream_call(response.write, chunk)
                     client_bytes += len(chunk)
-        await response.write_eof()
+        await _client_stream_call(response.write_eof)
         if usage_parser is not None:
             usage_parser.finish()
         if attempt is not None:
             attempt.finish(status, output_bytes=backend_bytes)
         _log_proxy_done(op, status, output_bytes=client_bytes)
         return response
+    except _DownstreamDisconnected:
+        if attempt is not None:
+            attempt.finish(499, error="client-disconnect", output_bytes=backend_bytes)
+        _log_proxy_done(op, 499, error="client-disconnect", output_bytes=client_bytes)
+        return response
+    except asyncio.CancelledError:
+        if attempt is not None:
+            attempt.finish(499, error="request-cancelled", output_bytes=backend_bytes)
+        _log_proxy_done(op, 499, error="request-cancelled", output_bytes=client_bytes)
+        raise
     except Exception as e:
         if attempt is not None:
             attempt.finish(getattr(e, "status", 502), error=e, output_bytes=backend_bytes)
-        raise
+        if not committed:
+            # Only failures before sending headers may try another backend.
+            raise
+        # A started SSE response cannot be replaced with another HTTP response
+        # or replayed on a second model: earlier tool-call deltas may be visible.
+        error = {
+            "message": "The upstream stream ended unexpectedly.",
+            "type": "upstream_timeout" if isinstance(e, asyncio.TimeoutError) else "upstream_error",
+        }
+        chunk = f"data: {json.dumps({'error': error})}\n\n".encode()
+        try:
+            await _client_stream_call(response.write, chunk)
+            client_bytes += len(chunk)
+            await _client_stream_call(response.write_eof)
+        except _DownstreamDisconnected:
+            _log_proxy_done(op, 499, error="client-disconnect", output_bytes=client_bytes)
+        else:
+            _log_proxy_done(op, 502, error=e, output_bytes=client_bytes)
+        return response
 
 
 async def _proxy_json(url, body, extra_headers=None, timeout=None, op=None):
