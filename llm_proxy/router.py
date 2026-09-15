@@ -1,6 +1,8 @@
 """Router — OpenAI-compatible proxy with model routing and session awareness."""
 
+import asyncio
 import json
+import math
 import os
 from urllib.parse import urlsplit
 
@@ -8,7 +10,11 @@ import aiohttp
 from aiohttp import web
 
 from llm_proxy.certs import certificate_fingerprint, generate_server_cert
-from llm_proxy.config import load_config_file, save_config_file
+from llm_proxy.config import (
+    DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+    load_config_file,
+    save_config_file,
+)
 from llm_proxy.oplog import elapsed_ms, log_event, now
 from llm_proxy.statistics import RequestTrace, SSEUsageParser, apply_usage
 from llm_proxy.stt_protocol import forward_initial_prompt_headers
@@ -52,6 +58,19 @@ _STATISTICS_PERIODS = {
     "30d": (30 * 86400, 86400),
     "all": (None, 86400),
 }
+
+
+def _inference_timeout_seconds(request):
+    settings = ((request.app.get("config") or {}).get("inference") or {})
+    return float(settings.get(
+        "request_timeout_seconds",
+        DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+    ))
+
+
+def _inference_client_timeout(request):
+    seconds = _inference_timeout_seconds(request)
+    return aiohttp.ClientTimeout(total=None, sock_connect=seconds, sock_read=seconds)
 
 
 class _SSECompletionTracker:
@@ -292,6 +311,8 @@ def create_control_app(runtime_manager, slot_manager, auth_manager=None, route_m
     app.router.add_post("/v1/control/routes/{name}/backends", handle_routes_add_backend)
     app.router.add_post("/v1/control/routes/{name}/backends/{index}/settings", handle_routes_update_backend)
     app.router.add_delete("/v1/control/routes/{name}/backends/{index}", handle_routes_remove_backend)
+    app.router.add_get("/v1/control/inference", handle_inference_settings)
+    app.router.add_post("/v1/control/inference", handle_inference_settings_update)
     app.router.add_get("/v1/control/tls", handle_tls_status)
     app.router.add_post("/v1/control/tls", handle_tls_toggle)
     app.router.add_post("/v1/control/tls/generate-cert", handle_tls_generate_cert)
@@ -471,6 +492,7 @@ async def handle_embeddings(request):
     return await _proxy_json(
         backend_url,
         body,
+        timeout=_inference_client_timeout(request),
         op={
             "kind": "embedding",
             "host": host,
@@ -614,9 +636,20 @@ async def handle_chat(request):
     }
     try:
         if stream:
-            return await _proxy_stream(request, backend_url, body, op=proxy_op)
+            return await _proxy_stream(
+                request,
+                backend_url,
+                body,
+                timeout=_inference_client_timeout(request),
+                op=proxy_op,
+            )
         else:
-            return await _proxy_json(backend_url, body, op=proxy_op)
+            return await _proxy_json(
+                backend_url,
+                body,
+                timeout=_inference_client_timeout(request),
+                op=proxy_op,
+            )
     finally:
         if slot_id is not None:
             await sm.finalize_request(
@@ -641,6 +674,7 @@ async def _proxy_routed(
     from llm_proxy.route_manager import _derive_endpoint_url
 
     candidates = route.failover_candidates(session_id=session_id)
+    timeout = _inference_client_timeout(request)
     last_err = None
     for backend in candidates:
         url = _derive_endpoint_url(backend["url"], route.kind)
@@ -672,6 +706,7 @@ async def _proxy_routed(
                     body,
                     headers,
                     backend=backend,
+                    timeout=timeout,
                     op={"kind": route.kind, "host": host, "model": body["model"],
                         "route": route.name, "backend": _backend_label(url),
                         "route_reason": backend.get("_route_reason"),
@@ -684,6 +719,7 @@ async def _proxy_routed(
                     body,
                     headers,
                     backend=backend,
+                    timeout=timeout,
                     op={"kind": route.kind, "host": host, "model": body["model"],
                         "route": route.name, "backend": _backend_label(url),
                         "route_reason": backend.get("_route_reason"),
@@ -714,11 +750,15 @@ async def _proxy_routed(
     return _finish_trace(trace, response, error="all-backends-failed")
 
 
-async def _proxy_json_inline(url, body, headers, backend=None, op=None):
+async def _proxy_json_inline(url, body, headers, backend=None, timeout=None, op=None):
     """Forward request; raises on failure (for failover callers)."""
     from llm_proxy.route_manager import backend_client_kwargs
 
-    timeout = aiohttp.ClientTimeout(total=300)
+    timeout = timeout or aiohttp.ClientTimeout(
+        total=None,
+        sock_connect=DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+        sock_read=DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+    )
     attempt = _start_attempt(op, body)
     try:
         async with aiohttp.ClientSession(**backend_client_kwargs(backend or {})) as sess:
@@ -744,11 +784,15 @@ async def _proxy_json_inline(url, body, headers, backend=None, op=None):
         raise
 
 
-async def _proxy_stream_inline(request, url, body, headers, backend=None, op=None):
+async def _proxy_stream_inline(request, url, body, headers, backend=None, timeout=None, op=None):
     """Forward streaming request; raises on connection failure (enables failover)."""
     from llm_proxy.route_manager import backend_client_kwargs
 
-    timeout = aiohttp.ClientTimeout(total=300)
+    timeout = timeout or aiohttp.ClientTimeout(
+        total=None,
+        sock_connect=DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+        sock_read=DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+    )
     attempt = _start_attempt(op, body)
     backend_bytes = 0
     client_bytes = 0
@@ -795,14 +839,22 @@ async def _proxy_stream_inline(request, url, body, headers, backend=None, op=Non
         raise
 
 
-async def _proxy_json(url, body, extra_headers=None, op=None):
+async def _proxy_json(url, body, extra_headers=None, timeout=None, op=None):
     """Forward request and return JSON response."""
     attempt = _start_attempt(op, body)
     try:
         async with aiohttp.ClientSession() as sess:
             headers = extra_headers or {}
-            async with sess.post(url, json=body, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=300)) as resp:
+            async with sess.post(
+                url,
+                json=body,
+                headers=headers,
+                timeout=timeout or aiohttp.ClientTimeout(
+                    total=None,
+                    sock_connect=DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+                    sock_read=DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+                ),
+            ) as resp:
                 raw = await resp.read()
                 data = json.loads(raw)
                 apply_usage(op.get("trace") if op else None, data)
@@ -820,7 +872,7 @@ async def _proxy_json(url, body, extra_headers=None, op=None):
         return web.json_response(payload, status=502)
 
 
-async def _proxy_stream(request, url, body, extra_headers=None, op=None):
+async def _proxy_stream(request, url, body, extra_headers=None, timeout=None, op=None):
     """Forward streaming request, relay SSE chunks."""
     response = web.StreamResponse(
         status=200,
@@ -837,7 +889,11 @@ async def _proxy_stream(request, url, body, extra_headers=None, op=None):
     usage_parser = _usage_parser(op)
     completion = _SSECompletionTracker()
     try:
-        timeout = aiohttp.ClientTimeout(total=300)
+        timeout = timeout or aiohttp.ClientTimeout(
+            total=None,
+            sock_connect=DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+            sock_read=DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+        )
         async with aiohttp.ClientSession() as sess:
             headers = extra_headers or {}
             async with sess.post(url, json=body, headers=headers, timeout=timeout) as backend:
@@ -857,7 +913,13 @@ async def _proxy_stream(request, url, body, extra_headers=None, op=None):
         return response
     except Exception as e:
         status = 502
-        error_chunk = f"data: {json.dumps({'error': str(e)})}\n\n"
+        if isinstance(e, asyncio.TimeoutError):
+            seconds = timeout.sock_read
+            message = f"Upstream inference timed out after {seconds:g} seconds without data"
+            error = {"message": message, "type": "upstream_timeout", "code": "upstream_timeout"}
+        else:
+            error = {"message": str(e), "type": "upstream_error", "code": "upstream_error"}
+        error_chunk = f"data: {json.dumps({'error': error})}\n\n"
         try:
             await response.write(error_chunk.encode())
             client_bytes += len(error_chunk.encode())
@@ -1123,7 +1185,7 @@ async def handle_stt_proxy(request):
                 ) as sess:
                     async with sess.post(
                         url, data=body, headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=300),
+                        timeout=_inference_client_timeout(request),
                         **backend_request_kwargs(backend),
                     ) as resp:
                         if resp.status >= 500:
@@ -1231,7 +1293,7 @@ async def handle_stt_proxy(request):
                 backend_url,
                 data=body,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=300),
+                timeout=_inference_client_timeout(request),
             ) as resp:
                 raw = await resp.read()
                 if attempt is not None:
@@ -1322,7 +1384,7 @@ async def handle_tts_proxy(request):
                         **backend_client_kwargs(backend)
                     ) as sess:
                         async with sess.post(url, json=body, headers=headers,
-                                            timeout=aiohttp.ClientTimeout(total=300),
+                                            timeout=_inference_client_timeout(request),
                                             **backend_request_kwargs(backend)) as backend_resp:
                             if backend_resp.status >= 500:
                                 raw = await backend_resp.read()
@@ -1432,7 +1494,11 @@ async def handle_tts_proxy(request):
     client_bytes = 0
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(backend_url, json=body, timeout=aiohttp.ClientTimeout(total=300)) as backend:
+            async with sess.post(
+                backend_url,
+                json=body,
+                timeout=_inference_client_timeout(request),
+            ) as backend:
                 status = backend.status
                 response.set_status(backend.status)
                 for hk, hv in backend.headers.items():
@@ -2035,6 +2101,60 @@ async def handle_routes_remove_backend(request):
         return web.json_response({"error": str(e)}, status=400)
     route = route_manager.get_route(name)
     return web.json_response({"ok": True, "route": route.status() if route else None, "removed_index": index})
+
+
+async def handle_inference_settings(request):
+    """GET /v1/control/inference — return live inference request settings."""
+    _require_control_auth(request)
+    return web.json_response({
+        "request_timeout_seconds": _inference_timeout_seconds(request),
+    })
+
+
+async def handle_inference_settings_update(request):
+    """POST /v1/control/inference — persist and apply inference settings."""
+    _require_control_auth(request)
+    body = await request.json()
+    value = body.get("request_timeout_seconds")
+    if isinstance(value, bool):
+        return web.json_response(
+            {"error": "request_timeout_seconds must be a positive number"},
+            status=400,
+        )
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return web.json_response(
+            {"error": "request_timeout_seconds must be a positive number"},
+            status=400,
+        )
+    if not math.isfinite(seconds) or seconds <= 0:
+        return web.json_response(
+            {"error": "request_timeout_seconds must be a positive number"},
+            status=400,
+        )
+
+    stored_value = int(seconds) if seconds.is_integer() else seconds
+    config = request.app.get("config") or {}
+    config_path = config.get("_config_path")
+    if not config_path:
+        config_path = os.path.expanduser("~/.config/llm-proxy/config.yaml")
+
+    current = load_config_file(config_path)
+    inference = current.get("inference")
+    if not isinstance(inference, dict):
+        inference = {}
+        current["inference"] = inference
+    inference["request_timeout_seconds"] = stored_value
+    save_config_file(config_path, current)
+
+    config["inference"] = config.get("inference") or {}
+    config["inference"]["request_timeout_seconds"] = stored_value
+    return web.json_response({
+        "ok": True,
+        "request_timeout_seconds": stored_value,
+        "restart_needed": False,
+    })
 
 
 async def handle_tls_status(request):

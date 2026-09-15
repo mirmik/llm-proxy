@@ -5,6 +5,11 @@ listen:
 cache_dir: "~/.cache/llm-proxy/kv"
 state_dir: "~/.config/llm-proxy"
 
+inference:
+  # Maximum time without data from an inference backend. Active streams may
+  # run longer; increase this for long prefills that produce no early output.
+  request_timeout_seconds: 300
+
 kv_cache:
   # Save the first successful state immediately, then checkpoint when either
   # limit is reached. Pending clean state is always saved on eviction/stop.

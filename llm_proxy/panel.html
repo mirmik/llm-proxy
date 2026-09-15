@@ -377,6 +377,19 @@
   <section id="view-settings" class="view">
 
     <section class="card">
+      <h2>Inference</h2>
+      <p class="hint">Maximum time without data from an inference backend. Active streams may run longer. Increase this for long prefills.</p>
+      <div class="field">
+        <label>Backend inactivity timeout (seconds)</label>
+        <input id="inferenceTimeout" type="number" min="0.001" step="1" value="300">
+      </div>
+      <div class="actions">
+        <button class="btn" id="inferenceSaveBtn">Save</button>
+      </div>
+      <div class="msg" id="inferenceMsg"></div>
+    </section>
+
+    <section class="card">
       <h2>Web UI password</h2>
       <p class="hint" id="passwordHint">No password is set — anyone reaching this page has full access.</p>
       <div class="field" id="passwordCurrentWrap" hidden>
@@ -551,7 +564,7 @@
     document.getElementById("topnav").style.visibility = (name === "login") ? "hidden" : "visible";
     document.getElementById("logoutBtn").hidden = !webAuthenticated;
     navButtons.forEach(b => b.classList.toggle("active", b.dataset.view === name));
-    if (name === "settings") { refreshTokens(); refreshTls(); }
+    if (name === "settings") { refreshInferenceSettings(); refreshTokens(); refreshTls(); }
     if (name === "overview") refreshStatistics();
     if (name === "runtimes") refreshState();
     if (name === "routing") refreshRoutes();
@@ -611,6 +624,38 @@
   logoutBtn.addEventListener("click", async () => {
     try { await api("/logout", {method: "POST"}); } catch {}
     await checkSession();
+  });
+
+  // ---------- inference ----------
+  const inferenceTimeoutInput = document.getElementById("inferenceTimeout");
+  const inferenceMsg = document.getElementById("inferenceMsg");
+
+  async function refreshInferenceSettings() {
+    try {
+      const data = await api("/v1/control/inference");
+      inferenceTimeoutInput.value = data.request_timeout_seconds;
+    } catch (e) {
+      setMsg(inferenceMsg, "Failed to load inference settings: " + e.message, "error");
+    }
+  }
+
+  document.getElementById("inferenceSaveBtn").addEventListener("click", async () => {
+    setMsg(inferenceMsg, "");
+    const requestTimeoutSeconds = Number(inferenceTimeoutInput.value);
+    if (!Number.isFinite(requestTimeoutSeconds) || requestTimeoutSeconds <= 0) {
+      setMsg(inferenceMsg, "Enter a positive timeout in seconds.", "error");
+      return;
+    }
+    try {
+      const data = await api("/v1/control/inference", {
+        method: "POST",
+        body: JSON.stringify({request_timeout_seconds: requestTimeoutSeconds}),
+      });
+      inferenceTimeoutInput.value = data.request_timeout_seconds;
+      setMsg(inferenceMsg, "Saved and applied to new inference requests.", "ok");
+    } catch (e) {
+      setMsg(inferenceMsg, "Failed: " + e.message, "error");
+    }
   });
 
   // ---------- password ----------

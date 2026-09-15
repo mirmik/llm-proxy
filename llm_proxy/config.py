@@ -1,9 +1,13 @@
 """Configuration loader."""
 
 import copy
+import math
 import os
 
 import yaml
+
+
+DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS = 300
 
 
 DEFAULT_CONFIG = {
@@ -32,6 +36,9 @@ DEFAULT_CONFIG = {
     "runtimes": {},
     "hosts": {},
     "routes": {},
+    "inference": {
+        "request_timeout_seconds": DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+    },
     "statistics": {
         "enabled": True,
         "database": None,
@@ -100,6 +107,7 @@ def load_config(path=None):
 
     _validate_statistics(config.get("statistics") or {})
     _validate_kv_cache(config.get("kv_cache") or {})
+    _validate_inference(config.get("inference") or {})
 
     return config
 
@@ -114,7 +122,9 @@ def load_config_file(path):
 
 def save_config_file(path, payload):
     path = os.path.expanduser(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=False)
@@ -188,6 +198,23 @@ def _validate_kv_cache(kv_cache):
             raise ValueError("kv_cache.checkpoint_max_requests must be a positive integer or null") from exc
         if not parsed_number.is_integer() or parsed_number < 1:
             raise ValueError("kv_cache.checkpoint_max_requests must be a positive integer or null")
+
+
+def _validate_inference(inference):
+    if not isinstance(inference, dict):
+        raise ValueError("inference must be a mapping")
+    value = inference.get(
+        "request_timeout_seconds",
+        DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+    )
+    if isinstance(value, bool):
+        raise ValueError("inference.request_timeout_seconds must be a positive number")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("inference.request_timeout_seconds must be a positive number") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("inference.request_timeout_seconds must be a positive number")
 
 
 def _normalize_runtime(runtime):

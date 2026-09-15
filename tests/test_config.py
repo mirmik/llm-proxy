@@ -85,6 +85,31 @@ class ConfigRuntimeTests(unittest.TestCase):
         self.assertEqual(config["kv_cache"]["checkpoint_interval_minutes"], 5)
         self.assertEqual(config["kv_cache"]["checkpoint_max_requests"], 5)
 
+    def test_inference_timeout_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.yaml")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{}\n")
+            config = load_config(path)
+
+        self.assertEqual(config["inference"]["request_timeout_seconds"], 300)
+
+    def test_invalid_inference_timeout_is_rejected(self):
+        for value in (0, -1, "never", True, float("inf")):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "config.yaml")
+                with open(path, "w", encoding="utf-8") as f:
+                    yaml.safe_dump({"inference": {"request_timeout_seconds": value}}, f)
+                with self.assertRaises(ValueError):
+                    load_config(path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.yaml")
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.safe_dump({"inference": "invalid"}, f)
+            with self.assertRaises(ValueError):
+                load_config(path)
+
     def test_kv_checkpoint_triggers_can_be_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.yaml")

@@ -1,7 +1,9 @@
+import asyncio
 import os
 import tempfile
 import unittest
 
+import yaml
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -221,6 +223,85 @@ class RouterStatisticsTests(unittest.IsolatedAsyncioTestCase):
         await response.read()
 
         self.assertEqual(sm.finalized, [("model", backend.server.port, 0, False)])
+
+    async def test_active_stream_can_outlive_inference_inactivity_timeout(self):
+        async def chat(request):
+            await request.json()
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await asyncio.sleep(0.08)
+            for index in range(4):
+                await response.write(
+                    f'data: {{"choices":[{{"delta":{{"content":"{index}"}}}}]}}\n\n'.encode()
+                )
+                await asyncio.sleep(0.03)
+            await response.write(b'data: {"choices":[{"finish_reason":"stop"}]}\n\n')
+            await response.write(b"data: [DONE]\n\n")
+            return response
+
+        backend = await self.backend([("POST", "/v1/chat/completions", chat)])
+        self.config["inference"] = {"request_timeout_seconds": 0.1}
+        proxy = await self.proxy(FakeRuntimeManager({"model": backend.server.port}))
+
+        response = await proxy.post(
+            "/v1/chat/completions",
+            json={"model": "model", "stream": True},
+        )
+        payload = await response.text()
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("data: [DONE]", payload)
+        self.assertNotIn("upstream_timeout", payload)
+
+    async def test_stream_timeout_has_machine_readable_error(self):
+        async def chat(request):
+            await request.json()
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await asyncio.sleep(0.08)
+            return response
+
+        backend = await self.backend([("POST", "/v1/chat/completions", chat)])
+        self.config["inference"] = {"request_timeout_seconds": 0.03}
+        proxy = await self.proxy(FakeRuntimeManager({"model": backend.server.port}))
+
+        response = await proxy.post(
+            "/v1/chat/completions",
+            json={"model": "model", "stream": True},
+        )
+        payload = await response.text()
+
+        self.assertEqual(response.status, 200)
+        self.assertIn('"type": "upstream_timeout"', payload)
+        self.assertIn('"code": "upstream_timeout"', payload)
+        self.assertIn("0.03 seconds without data", payload)
+
+    async def test_control_updates_inference_timeout_live_and_persists_it(self):
+        config_path = os.path.join(self.tmp.name, "config.yaml")
+        self.config["_config_path"] = config_path
+        control = await self.control()
+
+        initial = await control.get("/v1/control/inference")
+        self.assertEqual((await initial.json())["request_timeout_seconds"], 300)
+
+        updated = await control.post(
+            "/v1/control/inference",
+            json={"request_timeout_seconds": 900},
+        )
+        payload = await updated.json()
+
+        self.assertEqual(updated.status, 200)
+        self.assertFalse(payload["restart_needed"])
+        self.assertEqual(self.config["inference"]["request_timeout_seconds"], 900)
+        with open(config_path, "r", encoding="utf-8") as f:
+            persisted = yaml.safe_load(f)
+        self.assertEqual(persisted["inference"]["request_timeout_seconds"], 900)
+
+        rejected = await control.post(
+            "/v1/control/inference",
+            json={"request_timeout_seconds": 0},
+        )
+        self.assertEqual(rejected.status, 400)
 
     async def test_routed_failover_is_one_request_with_two_attempts(self):
         async def fail(request):
