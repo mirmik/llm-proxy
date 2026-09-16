@@ -1360,8 +1360,15 @@ async def handle_stt_proxy(request):
 
 
 def _resolve_tts_runtime(rm, requested=None):
-    preferred = requested or "tts-main"
+    preferred = "tts-main"
     tts_runtimes = rm.runtimes_by_kind("tts")
+    if requested is not None:
+        if not isinstance(requested, str) or not requested.strip():
+            return None, web.json_response({"error": "voice must be a non-empty string"}, status=400)
+        if requested in tts_runtimes:
+            return requested, None
+        return None, web.json_response(
+            {"error": f"Unknown TTS runtime: {requested}. Available: {tts_runtimes}"}, status=404)
     if preferred in tts_runtimes:
         return preferred, None
     if len(tts_runtimes) == 1:
@@ -1385,7 +1392,12 @@ async def handle_tts_proxy(request):
     rm = request.app["rm"]
     route_manager = request.app.get("routes")
     raw_body = await request.read()
-    body = json.loads(raw_body)
+    try:
+        body = json.loads(raw_body)
+    except (ValueError, UnicodeDecodeError):
+        return web.json_response({"error": "Expected JSON object"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "Expected JSON object"}, status=400)
     requested = body.pop("voice", None) if isinstance(body, dict) else None
     host = _client_host(request)
     trace = _new_trace(
@@ -1562,7 +1574,8 @@ async def handle_tts_proxy(request):
             error_response = web.json_response({"error": str(e)}, status=502)
             return _finish_trace(trace, error_response, error=e)
         log_event("request complete", kind="tts", host=host, runtime=runtime_name, status=502, ms=elapsed_ms(request_started), error=e)
-        await response.write_eof()
+        if request.transport:
+            request.transport.close()
         if trace is not None:
             trace.finish(502, error=e, output_bytes=client_bytes)
         return response
@@ -1579,7 +1592,7 @@ async def handle_tts_proxy(request):
 async def handle_tts_health(request):
     _require_client_auth(request)
     rm = request.app["rm"]
-    runtime_name, err = _resolve_tts_runtime(rm)
+    runtime_name, err = _resolve_tts_runtime(rm, request.query.get("voice"))
     if err:
         return err
     if not rm.is_running(runtime_name):
@@ -1596,8 +1609,8 @@ async def handle_tts_health(request):
     except Exception as e:
         return web.json_response({"error": str(e), "runtime": runtime_name}, status=502)
     data["runtime"] = runtime_name
-    data["loaded"] = True
-    return web.json_response(data)
+    data["loaded"] = resp.status == 200
+    return web.json_response(data, status=resp.status)
 
 
 async def handle_stt_health(request):
