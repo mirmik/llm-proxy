@@ -159,6 +159,35 @@
   .toolbar h2 { margin: 0; font-size: 1.1rem; }
   .toolbar .right { display: flex; gap: 8px; }
 
+  /* statistics overview */
+  .stats-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .stat-kpi { background: var(--bg-elev); border: 1px solid var(--border-soft); border-radius: 10px; padding: 14px 16px; }
+  .stat-kpi .label { color: var(--text-muted); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat-kpi .value { font-size: 1.45rem; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .stat-kpi .sub { color: var(--text-muted); font-size: 0.75rem; margin-top: 2px; }
+  .stat-charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  .stat-chart { min-height: 170px; }
+  .stat-chart svg { width: 100%; height: 130px; overflow: visible; }
+  .stat-chart .axis { stroke: var(--border); stroke-width: 1; }
+  .stat-chart .primary { fill: none; stroke: var(--accent); stroke-width: 2.5; }
+  .stat-chart .danger-line { fill: none; stroke: var(--danger); stroke-width: 2; }
+  .stat-chart .secondary-line { fill: none; stroke: var(--warning); stroke-width: 2; }
+  .stat-legend { color: var(--text-muted); font-size: 0.76rem; display: flex; gap: 14px; }
+  .stat-dot { width: 8px; height: 8px; display: inline-block; border-radius: 50%; margin-right: 5px; }
+  .period-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .stats-split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  .compact-table { overflow-x: auto; }
+  .compact-table table { min-width: 560px; }
+  @media (max-width: 760px) {
+    header { padding: 10px 12px; gap: 10px; display: grid; grid-template-columns: auto 1fr; }
+    header .right { grid-column: 2; grid-row: 1; justify-self: end; }
+    nav { grid-column: 1 / -1; grid-row: 2; width: 100%; overflow-x: auto; scrollbar-width: none; }
+    nav::-webkit-scrollbar { display: none; }
+    nav .nav-btn { white-space: nowrap; }
+    main { padding: 14px; }
+    .stat-charts, .stats-split { grid-template-columns: 1fr; }
+  }
+
   /* runtime cards */
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; align-items: start; }
   .runtime-card { background: var(--bg-elev); border: 1px solid var(--border-soft); border-radius: 10px; padding: 16px 18px; display: flex; flex-direction: column; gap: 8px; }
@@ -195,7 +224,8 @@
 <header>
   <h1>llm-proxy</h1>
   <nav id="topnav">
-    <button class="nav-btn active" data-view="runtimes">Runtimes</button>
+    <button class="nav-btn active" data-view="overview">Overview</button>
+    <button class="nav-btn" data-view="runtimes">Runtimes</button>
     <button class="nav-btn" data-view="routing">Routing</button>
     <button class="nav-btn" data-view="settings">Settings</button>
   </nav>
@@ -226,8 +256,61 @@
     </div>
   </section>
 
+  <!-- OVERVIEW -->
+  <section id="view-overview" class="view active">
+    <div class="card">
+      <div class="toolbar">
+        <div>
+          <h2>Usage overview</h2>
+          <div class="hint" id="statsRetention" style="margin:4px 0 0;">Local payload traffic and model activity.</div>
+        </div>
+        <div class="right" id="statsPeriods">
+          <button class="secondary period-btn" data-period="1h">1h</button>
+          <button class="secondary period-btn active" data-period="24h">24h</button>
+          <button class="secondary period-btn" data-period="7d">7d</button>
+          <button class="secondary period-btn" data-period="30d">30d</button>
+          <button class="secondary period-btn" data-period="all">All</button>
+          <button class="secondary" id="refreshStatsBtn">Refresh</button>
+        </div>
+      </div>
+      <div class="msg" id="statsMsg"></div>
+    </div>
+
+    <div class="stats-kpis" id="statsKpis"></div>
+
+    <div class="stat-charts">
+      <section class="card stat-chart">
+        <h2>Requests</h2>
+        <div class="stat-legend"><span><i class="stat-dot" style="background:var(--accent)"></i>all</span><span><i class="stat-dot" style="background:var(--danger)"></i>errors</span></div>
+        <div id="requestsChart"></div>
+      </section>
+      <section class="card stat-chart">
+        <h2>Payload traffic</h2>
+        <div class="stat-legend"><span><i class="stat-dot" style="background:var(--accent)"></i>client</span><span><i class="stat-dot" style="background:var(--warning)"></i>upstream</span></div>
+        <div id="trafficChart"></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <h2>Routing and backends</h2>
+      <p class="hint">Backend attempts are counted separately from client requests, so failover remains visible.</p>
+      <div class="compact-table"><table id="backendStatsTable"><thead><tr><th>Backend</th><th>Attempts</th><th>Share</th><th>Errors</th><th>p95</th><th>Payload</th></tr></thead><tbody></tbody></table></div>
+      <div class="empty" id="backendStatsEmpty" hidden>No routed backend attempts in this period.</div>
+    </section>
+
+    <div class="stats-split">
+      <section class="card"><h2>Models</h2><div class="compact-table"><table id="modelStatsTable"><thead><tr><th>Model</th><th>Requests</th><th>Errors</th><th>p95</th><th>Payload</th></tr></thead><tbody></tbody></table></div></section>
+      <section class="card"><h2>Clients</h2><div class="compact-table"><table id="clientStatsTable"><thead><tr><th>Client</th><th>Requests</th><th>Errors</th><th>p95</th><th>Payload</th></tr></thead><tbody></tbody></table></div></section>
+    </div>
+
+    <div class="stats-split">
+      <section class="card"><h2>Recent errors</h2><div class="compact-table"><table id="errorStatsTable"><thead><tr><th>Time</th><th>Kind/model</th><th>Status</th><th>Error</th></tr></thead><tbody></tbody></table></div><div class="empty" id="errorStatsEmpty" hidden>No errors in this period.</div></section>
+      <section class="card"><h2>Slow requests</h2><div class="compact-table"><table id="slowStatsTable"><thead><tr><th>Time</th><th>Kind/model</th><th>Duration</th><th>Attempts</th></tr></thead><tbody></tbody></table></div><div class="empty" id="slowStatsEmpty" hidden>No requests in this period.</div></section>
+    </div>
+  </section>
+
   <!-- RUNTIMES -->
-  <section id="view-runtimes" class="view active">
+  <section id="view-runtimes" class="view">
     <div class="card">
       <div class="toolbar">
         <h2>Managed runtimes</h2>
@@ -250,6 +333,7 @@
           <select id="nr-driver">
             <option value="llama_cpp">llama_cpp</option>
             <option value="voxcpm">voxcpm</option>
+            <option value="llama_cpp_embedding">llama_cpp_embedding</option>
             <option value="vllm">vllm</option>
             <option value="custom">custom</option>
           </select>
@@ -257,6 +341,7 @@
         <div class="field"><label>Kind</label>
           <select id="nr-kind">
             <option value="llm">llm</option>
+            <option value="embedding">embedding</option>
             <option value="stt">stt</option>
             <option value="tts">tts</option>
           </select>
@@ -291,6 +376,19 @@
 
   <!-- SETTINGS -->
   <section id="view-settings" class="view">
+
+    <section class="card">
+      <h2>Inference</h2>
+      <p class="hint">Maximum time without data from an inference backend. Active streams may run longer. Increase this for long prefills.</p>
+      <div class="field">
+        <label>Backend inactivity timeout (seconds)</label>
+        <input id="inferenceTimeout" type="number" min="0.001" step="1" value="300">
+      </div>
+      <div class="actions">
+        <button class="btn" id="inferenceSaveBtn">Save</button>
+      </div>
+      <div class="msg" id="inferenceMsg"></div>
+    </section>
 
     <section class="card">
       <h2>Web UI password</h2>
@@ -449,11 +547,12 @@
   let webAuthEnabled = false;
   let webAuthenticated = false;
   let apiAuthEnabled = false;
-  let currentView = "runtimes";
+  let currentView = "overview";
 
   const navButtons = document.querySelectorAll("#topnav .nav-btn");
   const views = {
     login: document.getElementById("view-login"),
+    overview: document.getElementById("view-overview"),
     runtimes: document.getElementById("view-runtimes"),
     routing: document.getElementById("view-routing"),
     settings: document.getElementById("view-settings"),
@@ -466,7 +565,8 @@
     document.getElementById("topnav").style.visibility = (name === "login") ? "hidden" : "visible";
     document.getElementById("logoutBtn").hidden = !webAuthenticated;
     navButtons.forEach(b => b.classList.toggle("active", b.dataset.view === name));
-    if (name === "settings") { refreshTokens(); refreshTls(); }
+    if (name === "settings") { refreshInferenceSettings(); refreshTokens(); refreshTls(); }
+    if (name === "overview") refreshStatistics();
     if (name === "runtimes") refreshState();
     if (name === "routing") refreshRoutes();
   }
@@ -517,7 +617,7 @@
       await api("/login", {method: "POST", body: JSON.stringify({password: loginPasswordInput.value})});
       loginPasswordInput.value = "";
       await checkSession();
-      showView("runtimes");
+      showView("overview");
     } catch (e) { setMsg(loginMsg, "Login failed: " + e.message, "error"); }
   });
   loginPasswordInput.addEventListener("keydown", e => { if (e.key === "Enter") document.getElementById("loginBtn").click(); });
@@ -525,6 +625,38 @@
   logoutBtn.addEventListener("click", async () => {
     try { await api("/logout", {method: "POST"}); } catch {}
     await checkSession();
+  });
+
+  // ---------- inference ----------
+  const inferenceTimeoutInput = document.getElementById("inferenceTimeout");
+  const inferenceMsg = document.getElementById("inferenceMsg");
+
+  async function refreshInferenceSettings() {
+    try {
+      const data = await api("/v1/control/inference");
+      inferenceTimeoutInput.value = data.request_timeout_seconds;
+    } catch (e) {
+      setMsg(inferenceMsg, "Failed to load inference settings: " + e.message, "error");
+    }
+  }
+
+  document.getElementById("inferenceSaveBtn").addEventListener("click", async () => {
+    setMsg(inferenceMsg, "");
+    const requestTimeoutSeconds = Number(inferenceTimeoutInput.value);
+    if (!Number.isFinite(requestTimeoutSeconds) || requestTimeoutSeconds <= 0) {
+      setMsg(inferenceMsg, "Enter a positive timeout in seconds.", "error");
+      return;
+    }
+    try {
+      const data = await api("/v1/control/inference", {
+        method: "POST",
+        body: JSON.stringify({request_timeout_seconds: requestTimeoutSeconds}),
+      });
+      inferenceTimeoutInput.value = data.request_timeout_seconds;
+      setMsg(inferenceMsg, "Saved and applied to new inference requests.", "ok");
+    } catch (e) {
+      setMsg(inferenceMsg, "Failed: " + e.message, "error");
+    }
   });
 
   // ---------- password ----------
@@ -788,14 +920,17 @@
   const newRuntimeBtn = document.getElementById("newRuntimeBtn");
   const newRuntimeCloseBtn = document.getElementById("newRuntimeCloseBtn");
   const nrDriver = document.getElementById("nr-driver");
+  const nrKind = document.getElementById("nr-kind");
   const nrVenvWrap = document.getElementById("nr-venv-wrap");
   const nrSlotsWrap = document.getElementById("nr-slots-wrap");
 
   function syncDriverFields() {
     const d = nrDriver.value;
+    if (d === "llama_cpp_embedding") nrKind.value = "embedding";
+    else if (d === "llama_cpp") nrKind.value = "llm";
+    else if (d === "voxcpm") nrKind.value = "tts";
     nrVenvWrap.hidden = !(d === "vllm" || d === "custom" || d === "voxcpm");
     nrSlotsWrap.hidden = (d === "stt" || d === "tts" || d === "voxcpm");
-    if (d === "voxcpm") document.getElementById("nr-kind").value = "tts";
   }
   nrDriver.addEventListener("change", syncDriverFields);
 
@@ -836,6 +971,133 @@
       await refreshState();
     } catch (e) { setMsg(newRuntimeMsg, "Create failed: " + e.message, "error"); }
   });
+
+  // ---------- statistics overview ----------
+  let statisticsPeriod = "24h";
+
+  function formatNumber(value) {
+    if (value == null) return "—";
+    return new Intl.NumberFormat(undefined, {maximumFractionDigits: 1}).format(value);
+  }
+
+  function formatBytes(value) {
+    if (value == null) return "—";
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let n = Number(value) || 0;
+    let i = 0;
+    while (Math.abs(n) >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
+  }
+
+  function formatPercent(value) {
+    return `${((Number(value) || 0) * 100).toFixed(1)}%`;
+  }
+
+  function metricCard(label, value, sub = "") {
+    return `<div class="stat-kpi"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div><div class="sub">${escapeHtml(sub)}</div></div>`;
+  }
+
+  function svgLine(values, className, width = 600, height = 120, sharedMax = null) {
+    if (!values.length) return "";
+    const max = sharedMax == null ? Math.max(...values, 1) : Math.max(sharedMax, 1);
+    const points = values.map((value, index) => {
+      const x = values.length === 1 ? width / 2 : index * width / (values.length - 1);
+      const y = height - (Number(value) || 0) * height / max;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(" ");
+    return `<polyline class="${className}" points="${points}"></polyline>`;
+  }
+
+  function renderChart(target, primary, secondary, secondaryClass) {
+    const width = 600, height = 120;
+    if (!primary.length) {
+      target.innerHTML = `<div class="empty">No samples in this period.</div>`;
+      return;
+    }
+    const max = Math.max(...primary, ...secondary, 1);
+    target.innerHTML = `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+      <line class="axis" x1="0" y1="${height}" x2="${width}" y2="${height}"></line>
+      ${svgLine(primary, "primary", width, height, max)}
+      ${svgLine(secondary, secondaryClass, width, height, max)}
+    </svg>`;
+  }
+
+  function renderBreakdown(tableId, rows, nameLabel) {
+    const tbody = document.querySelector(`#${tableId} tbody`);
+    tbody.innerHTML = (rows || []).map(row => `<tr>
+      <td class="mono">${escapeHtml(row.name || "—")}</td>
+      <td>${formatNumber(row.count)}</td>
+      ${tableId === "backendStatsTable" ? `<td>${formatPercent(row.share)}</td>` : ""}
+      <td>${formatNumber(row.errors)}</td>
+      <td>${row.p95_ms == null ? "—" : formatNumber(row.p95_ms) + " ms"}</td>
+      <td>${formatBytes((row.input_bytes || 0) + (row.output_bytes || 0))}</td>
+    </tr>`).join("");
+  }
+
+  function renderRecent(tableId, rows, slow) {
+    const tbody = document.querySelector(`#${tableId} tbody`);
+    tbody.innerHTML = (rows || []).map(row => `<tr>
+      <td>${new Date(row.started_at * 1000).toLocaleString()}</td>
+      <td>${escapeHtml(row.kind || "—")} / <span class="mono">${escapeHtml(row.resolved_model || row.runtime || row.route || "—")}</span></td>
+      ${slow
+        ? `<td>${formatNumber(row.duration_ms)} ms</td><td>${formatNumber(row.attempt_count)}</td>`
+        : `<td>${escapeHtml(row.status == null ? "—" : row.status)}</td><td>${escapeHtml(row.error || row.outcome || "error")}</td>`}
+    </tr>`).join("");
+  }
+
+  async function refreshStatistics() {
+    const msg = document.getElementById("statsMsg");
+    setMsg(msg, "Loading…");
+    try {
+      const data = await api(`/v1/control/statistics?period=${encodeURIComponent(statisticsPeriod)}`);
+      const summary = data.summary || {};
+      if (!data.enabled) setMsg(msg, "Statistics collection is disabled in config.", "error");
+      else setMsg(msg, `Updated ${new Date().toLocaleTimeString()}. Payload bytes exclude HTTP/TLS overhead.`, "ok");
+      document.getElementById("statsRetention").textContent = data.retention_days
+        ? `Detailed local history is retained for ${data.retention_days} days.`
+        : "Detailed local history has no automatic expiration.";
+      const successRate = summary.requests ? summary.successful / summary.requests : 0;
+      const latency = summary.latency_ms || {};
+      const tokenSub = summary.total_tokens == null
+        ? "usage unavailable"
+        : `${formatPercent(summary.usage_coverage)} usage coverage`;
+      document.getElementById("statsKpis").innerHTML = [
+        metricCard("Requests", formatNumber(summary.requests), `${formatPercent(successRate)} successful`),
+        metricCard("Active", formatNumber(summary.inflight), `${formatNumber(summary.errors)} errors`),
+        metricCard("Client payload", formatBytes((summary.client_input_bytes || 0) + (summary.client_output_bytes || 0)), "received + returned"),
+        metricCard("Upstream payload", formatBytes((summary.upstream_input_bytes || 0) + (summary.upstream_output_bytes || 0)), `${formatNumber(summary.attempts)} attempts`),
+        metricCard("Latency p95", latency.p95 == null ? "—" : `${formatNumber(latency.p95)} ms`, `avg ${latency.avg == null ? "—" : formatNumber(latency.avg) + " ms"}`),
+        metricCard("Tokens", formatNumber(summary.total_tokens), tokenSub),
+        metricCard("Throughput", summary.tokens_per_second == null ? "—" : `${formatNumber(summary.tokens_per_second)} tok/s`, "observed streaming usage"),
+        metricCard("Failovers", formatNumber(summary.failovers), "additional backend attempts"),
+      ].join("");
+
+      const series = data.series || [];
+      renderChart(document.getElementById("requestsChart"), series.map(x => x.requests), series.map(x => x.errors), "danger-line");
+      renderChart(document.getElementById("trafficChart"), series.map(x => x.client_bytes), series.map(x => x.upstream_bytes), "secondary-line");
+
+      const breakdown = data.breakdown || {};
+      renderBreakdown("backendStatsTable", breakdown.backend || []);
+      renderBreakdown("modelStatsTable", breakdown.model || []);
+      renderBreakdown("clientStatsTable", breakdown.client || []);
+      document.getElementById("backendStatsEmpty").hidden = !!(breakdown.backend || []).length;
+      renderRecent("errorStatsTable", data.recent_errors || [], false);
+      renderRecent("slowStatsTable", data.slow_requests || [], true);
+      document.getElementById("errorStatsEmpty").hidden = !!(data.recent_errors || []).length;
+      document.getElementById("slowStatsEmpty").hidden = !!(data.slow_requests || []).length;
+    } catch (e) {
+      setMsg(msg, "Failed to load statistics: " + e.message, "error");
+    }
+  }
+
+  document.getElementById("statsPeriods").addEventListener("click", event => {
+    const period = event.target.dataset && event.target.dataset.period;
+    if (!period) return;
+    statisticsPeriod = period;
+    document.querySelectorAll(".period-btn").forEach(button => button.classList.toggle("active", button.dataset.period === period));
+    refreshStatistics();
+  });
+  document.getElementById("refreshStatsBtn").addEventListener("click", refreshStatistics);
 
   // ---------- routing ----------
   const routesContainer = document.getElementById("routesContainer");

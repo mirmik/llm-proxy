@@ -13,6 +13,7 @@ Implemented:
 
 - `RuntimeManager` as the unified process owner
 - `llama_cpp`, `faster_whisper`, `xtts`, and `voxcpm` drivers
+- `llama_cpp_embedding` driver and OpenAI-compatible `/v1/embeddings`
 - config section `runtimes:`
 - control API for listing runtimes, starting/stopping runtimes, and reading logs
 - CLI control commands backed by the same control API
@@ -20,6 +21,9 @@ Implemented:
 - dedicated in-repo runner modules for STT/TTS
 - manual or on-demand loading, independently configured per runtime
 - TTS PCM forwarding, including streaming VoxCPM2 output
+
+Embedding runtime configuration and API behavior are documented in
+`EMBEDDINGS.md`.
 
 ## Driver Contract
 

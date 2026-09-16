@@ -1,9 +1,13 @@
 """Configuration loader."""
 
 import copy
+import math
 import os
 
 import yaml
+
+
+DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS = 300
 
 
 DEFAULT_CONFIG = {
@@ -32,6 +36,17 @@ DEFAULT_CONFIG = {
     "runtimes": {},
     "hosts": {},
     "routes": {},
+    "inference": {
+        "request_timeout_seconds": DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+    },
+    "statistics": {
+        "enabled": True,
+        "database": None,
+        "retention_days": 30,
+        "cleanup_interval_hours": 24,
+        "client_identity": "token",
+        "include_host": False,
+    },
     "kv_cache": {
         "cleanup_enabled": True,
         "ttl_hours": 168,
@@ -39,6 +54,8 @@ DEFAULT_CONFIG = {
         "max_total_gb": None,
         "max_per_runtime_gb": None,
         "keep_active_sessions": True,
+        "checkpoint_interval_minutes": 5,
+        "checkpoint_max_requests": 5,
     },
 }
 
@@ -88,6 +105,10 @@ def load_config(path=None):
     for name, route in (config.get("routes") or {}).items():
         _validate_route(name, route)
 
+    _validate_statistics(config.get("statistics") or {})
+    _validate_kv_cache(config.get("kv_cache") or {})
+    _validate_inference(config.get("inference") or {})
+
     return config
 
 
@@ -101,7 +122,9 @@ def load_config_file(path):
 
 def save_config_file(path, payload):
     path = os.path.expanduser(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=False)
@@ -137,8 +160,61 @@ def _validate_route(name, route):
         if not b.get("url"):
             raise ValueError(f"Route '{name}'.backends[{i}] requires 'url'")
     kind = route.get("kind", "llm")
-    if kind not in ("llm", "stt", "tts"):
+    if kind not in ("llm", "embedding", "stt", "tts"):
         raise ValueError(f"Route '{name}' has unknown kind: {kind}")
+
+
+def _validate_statistics(statistics):
+    try:
+        retention_days = float(statistics.get("retention_days", 30))
+        cleanup_hours = float(statistics.get("cleanup_interval_hours", 24))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("statistics retention/cleanup values must be numbers") from exc
+    if retention_days < 0:
+        raise ValueError("statistics.retention_days must be >= 0")
+    if cleanup_hours <= 0:
+        raise ValueError("statistics.cleanup_interval_hours must be > 0")
+    if statistics.get("client_identity", "token") not in ("token", "none"):
+        raise ValueError("statistics.client_identity must be 'token' or 'none'")
+
+
+def _validate_kv_cache(kv_cache):
+    interval = kv_cache.get("checkpoint_interval_minutes", 5)
+    if interval is not None:
+        try:
+            interval = float(interval)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("kv_cache.checkpoint_interval_minutes must be a number or null") from exc
+        if interval < 0:
+            raise ValueError("kv_cache.checkpoint_interval_minutes must be >= 0")
+
+    max_requests = kv_cache.get("checkpoint_max_requests", 5)
+    if max_requests is not None:
+        if isinstance(max_requests, bool):
+            raise ValueError("kv_cache.checkpoint_max_requests must be a positive integer or null")
+        try:
+            parsed_number = float(max_requests)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("kv_cache.checkpoint_max_requests must be a positive integer or null") from exc
+        if not parsed_number.is_integer() or parsed_number < 1:
+            raise ValueError("kv_cache.checkpoint_max_requests must be a positive integer or null")
+
+
+def _validate_inference(inference):
+    if not isinstance(inference, dict):
+        raise ValueError("inference must be a mapping")
+    value = inference.get(
+        "request_timeout_seconds",
+        DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
+    )
+    if isinstance(value, bool):
+        raise ValueError("inference.request_timeout_seconds must be a positive number")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("inference.request_timeout_seconds must be a positive number") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("inference.request_timeout_seconds must be a positive number")
 
 
 def _normalize_runtime(runtime):

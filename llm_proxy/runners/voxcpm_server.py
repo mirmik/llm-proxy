@@ -20,6 +20,10 @@ LOG = logging.getLogger("voxcpm")
 class VoxCPMEngine:
     def __init__(self, args):
         import torch
+        # Initialize the selected CUDA runtime before optional audio libraries.
+        # On the 3090 host, importing those first breaks lazy CUDA initialization.
+        if args.device.startswith("cuda"):
+            torch.cuda.init()
         from voxcpm import VoxCPM
 
         self.torch = torch

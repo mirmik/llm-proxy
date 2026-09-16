@@ -5,6 +5,17 @@ listen:
 cache_dir: "~/.cache/llm-proxy/kv"
 state_dir: "~/.config/llm-proxy"
 
+inference:
+  # Maximum time without data from an inference backend. Active streams may
+  # run longer; increase this for long prefills that produce no early output.
+  request_timeout_seconds: 300
+
+kv_cache:
+  # Save the first successful state immediately, then checkpoint when either
+  # limit is reached. Pending clean state is always saved on eviction/stop.
+  checkpoint_interval_minutes: 5
+  checkpoint_max_requests: 5
+
 tls:
   enabled: false
   cert_file: "~/.config/llm-proxy/certs/server.crt"
@@ -48,6 +59,20 @@ runtimes:
       --slot-save-path {runtime_kv}
       --flash-attn on
       --jinja
+
+  bge-m3:
+    driver: "llama_cpp_embedding"
+    gpu: "local"
+    autoload: false
+    on_demand: true
+    port: 8084
+    slots: 2
+    command: >
+      {defaults.llama_bin}
+      --model ~/project/models/bge-m3-Q8_0.gguf
+      --host 127.0.0.1 --port {port}
+      --embedding --pooling cls --parallel {slots}
+      -c 16384 -b 2048 -ub 2048
 
   stt-main:
     driver: "faster_whisper"

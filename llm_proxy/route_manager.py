@@ -12,12 +12,14 @@ from llm_proxy.config import load_config_file, save_config_file
 
 KIND_ENDPOINTS = {
     "llm": "/v1/chat/completions",
+    "embedding": "/v1/embeddings",
     "stt": "/stt",
     "tts": "/v1/audio/speech",
 }
 
 KIND_HEALTH_DEFAULTS = {
     "llm": "/health",
+    "embedding": "/health",
     "stt": "/health",
     "tts": "/health",
 }
@@ -45,6 +47,14 @@ def backend_client_kwargs(backend):
     verify_tls = backend.get("tls_verify", backend.get("verify_tls", True))
     if verify_tls is False:
         return {"connector": aiohttp.TCPConnector(ssl=False)}
+    return {}
+
+
+def backend_request_kwargs(backend):
+    """Build per-request kwargs suitable for a shared ClientSession."""
+    verify_tls = backend.get("tls_verify", backend.get("verify_tls", True))
+    if verify_tls is False:
+        return {"ssl": False}
     return {}
 
 
@@ -132,21 +142,27 @@ class Route:
             self._active_url = self._best_available_locked()
             self._drop_sessions_for_url_locked(url)
 
-    async def probe(self, url):
+    async def probe(self, url, session=None):
         health_url = _derive_health_url(url, self.health_path)
         backend = self._by_url.get(url) or {}
+        owned_session = session is None
+        if owned_session:
+            session = aiohttp.ClientSession(**backend_client_kwargs(backend))
         t0 = time.time()
         try:
-            async with aiohttp.ClientSession(**backend_client_kwargs(backend)) as sess:
-                async with sess.get(
-                    health_url,
-                    timeout=aiohttp.ClientTimeout(total=self.health_timeout),
-                ) as resp:
-                    ok = resp.status < 500
-                    latency = time.time() - t0
+            async with session.get(
+                health_url,
+                timeout=aiohttp.ClientTimeout(total=self.health_timeout),
+                **backend_request_kwargs(backend),
+            ) as resp:
+                ok = resp.status < 500
+                latency = time.time() - t0
         except Exception:
             ok = False
             latency = None
+        finally:
+            if owned_session:
+                await session.close()
         await self._mark(url, ok, latency)
         return ok, latency
 
@@ -382,6 +398,7 @@ class RouteManager:
         self._routes = {}
         self._monitor_tasks = {}
         self._monitoring_started = False
+        self._health_session = None
         self._stop_event = asyncio.Event()
         self._load_from_config(config)
 
@@ -433,7 +450,7 @@ class RouteManager:
             for b in route.backends:
                 if self._stop_event.is_set():
                     return
-                await route.probe(b["url"])
+                await route.probe(b["url"], session=self._health_session)
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),
@@ -448,6 +465,8 @@ class RouteManager:
             return
         self._stop_event.clear()
         self._monitoring_started = True
+        if any(route.backends for route in self._routes.values()):
+            self._health_session = aiohttp.ClientSession()
         self._monitor_tasks = {}
         for route in self._routes.values():
             if route.backends:
@@ -463,6 +482,9 @@ class RouteManager:
             task.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
         self._monitor_tasks = {}
+        if self._health_session is not None:
+            await self._health_session.close()
+            self._health_session = None
         return results
 
     async def _restart_monitoring_if_running(self):
@@ -474,6 +496,8 @@ class RouteManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._monitor_tasks = {}
+        if self._health_session is None and any(route.backends for route in self._routes.values()):
+            self._health_session = aiohttp.ClientSession()
         for route in self._routes.values():
             if route.backends:
                 self._monitor_tasks[route.name] = asyncio.create_task(
