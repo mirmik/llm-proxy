@@ -9,6 +9,8 @@ from urllib.parse import urlsplit
 import aiohttp
 from aiohttp import web
 
+from llm_proxy.tokenization import handle_tokenize
+
 from llm_proxy.certs import certificate_fingerprint, generate_server_cert
 from llm_proxy.config import (
     DEFAULT_INFERENCE_REQUEST_TIMEOUT_SECONDS,
@@ -269,6 +271,7 @@ def create_api_app(runtime_manager, slot_manager, auth_manager=None, route_manag
     app.router.add_get("/tts/health", handle_tts_health)
     app.router.add_post("/v1/embeddings", handle_embeddings)
     app.router.add_post("/v1/chat/completions", handle_chat)
+    app.router.add_post("/tokenize", handle_tokenize)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/v1/capabilities", handle_capabilities)
     app.router.add_get("/health", handle_health)
