@@ -211,3 +211,6 @@ __marimo__/
 
 .claude/
 .codex/
+
+# Per-runtime Python environments
+.venv*/

@@ -4,6 +4,7 @@ from llm_proxy.drivers.faster_whisper import FasterWhisperDriver
 from llm_proxy.drivers.llama_cpp import LlamaCppDriver
 from llm_proxy.drivers.llama_cpp_embedding import LlamaCppEmbeddingDriver
 from llm_proxy.drivers.xtts import XTTSDriver
+from llm_proxy.drivers.voxcpm import VoxCPMDriver
 
 
 def build_driver_registry():
@@ -12,5 +13,6 @@ def build_driver_registry():
         LlamaCppEmbeddingDriver(),
         FasterWhisperDriver(),
         XTTSDriver(),
+        VoxCPMDriver(),
     ]
     return {driver.name: driver for driver in drivers}

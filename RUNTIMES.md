@@ -12,11 +12,15 @@
 Implemented:
 
 - `RuntimeManager` as the unified process owner
-- `llama_cpp` driver
+- `llama_cpp`, `faster_whisper`, `xtts`, and `voxcpm` drivers
 - `llama_cpp_embedding` driver and OpenAI-compatible `/v1/embeddings`
 - config section `runtimes:`
 - control API for listing runtimes, starting/stopping runtimes, and reading logs
 - CLI control commands backed by the same control API
+
+- dedicated in-repo runner modules for STT/TTS
+- manual or on-demand loading, independently configured per runtime
+- TTS PCM forwarding, including streaming VoxCPM2 output
 
 Embedding runtime configuration and API behavior are documented in
 `EMBEDDINGS.md`.
@@ -85,10 +89,14 @@ runtimes:
       --host 127.0.0.1 --port {port}
 ```
 
-## Next Step
+## TTS runtimes
 
-The next concrete step is to add:
+XTTS and VoxCPM2 are managed processes with their own Python environments.
+Use `autoload: false` and `on_demand: false` for models that should only occupy
+GPU memory when explicitly started. A stopped TTS returns 503 without loading.
+`voice` selects the runtime for `/v1/audio/speech`; `/tts/health?voice=NAME`
+checks that specific runtime. Unknown names return 404, not a different voice.
 
-- `llm_proxy/drivers/faster_whisper.py`
-- `llm_proxy/drivers/xtts.py`
-- in-repo runner modules so STT/TTS parameters are controlled directly by `llm-proxy`
+See [TTS.md](TTS.md) for VoxCPM2 setup, PCM format, streaming, and verification.
+The proxy forwards TTS bytes; synthesis behavior depends on the runner. XTTS
+returns a completed waveform, while VoxCPM2 can return incremental PCM.

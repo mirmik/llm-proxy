@@ -332,6 +332,7 @@
         <div class="field"><label>Driver</label>
           <select id="nr-driver">
             <option value="llama_cpp">llama_cpp</option>
+            <option value="voxcpm">voxcpm</option>
             <option value="llama_cpp_embedding">llama_cpp_embedding</option>
             <option value="vllm">vllm</option>
             <option value="custom">custom</option>
@@ -927,8 +928,9 @@
     const d = nrDriver.value;
     if (d === "llama_cpp_embedding") nrKind.value = "embedding";
     else if (d === "llama_cpp") nrKind.value = "llm";
-    nrVenvWrap.hidden = !(d === "vllm" || d === "custom");
-    nrSlotsWrap.hidden = (d === "stt" || d === "tts");
+    else if (d === "voxcpm") nrKind.value = "tts";
+    nrVenvWrap.hidden = !(d === "vllm" || d === "custom" || d === "voxcpm");
+    nrSlotsWrap.hidden = (d === "stt" || d === "tts" || d === "voxcpm");
   }
   nrDriver.addEventListener("change", syncDriverFields);
 

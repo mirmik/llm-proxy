@@ -198,7 +198,7 @@ class RuntimeManager:
 
         spec is a dict with keys:
           name (required)         — runtime identifier, unique
-          driver (required)       — llama_cpp / llama_cpp_embedding / faster_whisper / xtts
+          driver (required)       — llama_cpp / llama_cpp_embedding / faster_whisper / xtts / voxcpm
           gpu (optional)
           autoload (optional)
           on_demand (optional)
