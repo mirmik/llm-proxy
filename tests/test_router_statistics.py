@@ -155,6 +155,32 @@ class RouterStatisticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempt["runtime"], "model")
         self.assertEqual(attempt["outcome"], "success")
 
+    async def test_local_stream_preserves_backend_http_error(self):
+        error = {"error": {"message": "images are not supported", "type": "invalid_request_error"}}
+        async def chat(request):
+            return web.json_response(error, status=400)
+        backend = await self.backend([("POST", "/v1/chat/completions", chat)])
+        slots = TrackingSlotManager()
+        proxy = await self.proxy(FakeRuntimeManager({"model": backend.server.port}), sm=slots)
+        response = await proxy.post("/v1/chat/completions", json={"model": "model", "stream": True})
+        self.assertEqual(response.status, 400)
+        self.assertEqual(response.content_type, "application/json")
+        self.assertEqual(await response.json(), error)
+        self.assertFalse(slots.finalized[-1][-1])
+        await self.store.flush()
+        self.assertEqual(self.store.fetch_requests()[0]["status"], 400)
+
+    async def test_local_stream_timeout_before_headers_is_http_error(self):
+        async def chat(request):
+            await asyncio.sleep(.1)
+            return web.json_response({})
+        backend = await self.backend([("POST", "/v1/chat/completions", chat)])
+        self.config["inference"] = {"request_timeout_seconds": .01}
+        proxy = await self.proxy(FakeRuntimeManager({"model": backend.server.port}))
+        response = await proxy.post("/v1/chat/completions", json={"model": "model", "stream": True})
+        self.assertEqual(response.status, 502)
+        self.assertEqual((await response.json())["error"]["code"], "upstream_timeout")
+
     async def test_streaming_chat_collects_fragmented_usage_and_ttft(self):
         async def chat(request):
             await request.json()

@@ -926,7 +926,6 @@ async def _proxy_stream(request, url, body, extra_headers=None, timeout=None, op
             "Cache-Control": "no-cache",
         },
     )
-    await response.prepare(request)
 
     attempt = _start_attempt(op, body)
     backend_bytes = 0
@@ -943,6 +942,17 @@ async def _proxy_stream(request, url, body, extra_headers=None, timeout=None, op
             headers = extra_headers or {}
             async with sess.post(url, json=body, headers=headers, timeout=timeout) as backend:
                 status = backend.status
+                if status >= 400:
+                    payload = await backend.read()
+                    backend_bytes = client_bytes = len(payload)
+                    if attempt is not None:
+                        attempt.finish(status, output_bytes=backend_bytes)
+                    _log_proxy_done(op, status, output_bytes=client_bytes)
+                    return web.Response(
+                        status=status, body=payload,
+                        headers={"Content-Type": backend.headers.get("Content-Type", "application/json")},
+                    )
+                await response.prepare(request)
                 async for chunk in backend.content.iter_any():
                     backend_bytes += len(chunk)
                     completion.feed(chunk)
@@ -964,6 +974,13 @@ async def _proxy_stream(request, url, body, extra_headers=None, timeout=None, op
             error = {"message": message, "type": "upstream_timeout", "code": "upstream_timeout"}
         else:
             error = {"message": str(e), "type": "upstream_error", "code": "upstream_error"}
+        if not response.prepared:
+            payload = {"error": error}
+            if attempt is not None:
+                attempt.finish(status, error=e, output_bytes=backend_bytes)
+            result = web.json_response(payload, status=status)
+            _log_proxy_done(op, status, error=e, output_bytes=len(result.body))
+            return result
         error_chunk = f"data: {json.dumps({'error': error})}\n\n"
         try:
             await response.write(error_chunk.encode())
