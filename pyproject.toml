@@ -1,8 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "llm-proxy"
 version = "0.1.0"
 description = "LLM proxy with multi-model orchestration and KV cache management"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [{name = "mirmik"}]
+keywords = ["llm", "proxy", "llama-cpp", "inference", "self-hosted"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: AsyncIO",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
 dependencies = [
     "aiohttp>=3.9",
     "pyyaml>=6.0",
@@ -10,6 +27,14 @@ dependencies = [
 
 [project.scripts]
 llm-proxy = "llm_proxy.main:main"
+
+[project.urls]
+Homepage = "https://github.com/mirmik/llm-proxy"
+Repository = "https://github.com/mirmik/llm-proxy"
+Issues = "https://github.com/mirmik/llm-proxy/issues"
+
+[tool.setuptools.packages.find]
+include = ["llm_proxy*"]
 
 [tool.setuptools.package-data]
 llm_proxy = ["panel.html"]

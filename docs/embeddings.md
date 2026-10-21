@@ -21,7 +21,7 @@ runtimes:
     slots: 2
     command: >
       {defaults.llama_bin}
-      --model ~/project/models/bge-m3-Q8_0.gguf
+      --model ~/models/bge-m3-Q8_0.gguf
       --host 127.0.0.1 --port {port}
       --embedding --pooling cls --parallel {slots}
       -c 16384 -b 2048 -ub 2048
@@ -85,7 +85,7 @@ Successful and error responses from a reachable backend retain its HTTP
 status. Statistics contain kind, model/runtime names, status, timings, byte
 counts, and standard usage counters, but never input text or vectors.
 
-Run the repeatable multilingual check with:
+From the repository root, run the repeatable multilingual check with:
 
 ```bash
 LLM_PROXY_TOKEN='<token>' python scripts/embedding_quality_smoke.py

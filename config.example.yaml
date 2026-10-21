@@ -1,0 +1,73 @@
+# Copy to config.yaml and adjust the binary and model paths before starting chat.
+# Both listeners are local-only; models start only through the panel or CLI.
+listen:
+  host: 127.0.0.1
+  port: 8090
+
+control:
+  host: 127.0.0.1
+  port: 8091
+
+cache_dir: ~/.cache/llm-proxy/kv
+state_dir: ~/.config/llm-proxy
+
+auth:
+  enabled: false
+
+tls:
+  enabled: false
+  cert_file: ~/.config/llm-proxy/certs/server.crt
+  key_file: ~/.config/llm-proxy/certs/server.key
+
+inference:
+  # Inactivity timeout, not a total limit on the duration of an active stream.
+  request_timeout_seconds: 300
+
+kv_cache:
+  checkpoint_interval_minutes: 5
+  checkpoint_max_requests: 5
+
+statistics:
+  enabled: true
+  retention_days: 30
+  client_identity: token
+  include_host: false
+
+defaults:
+  llama_bin: ~/llama.cpp/build/bin/llama-server
+  chat_model: ~/models/chat.gguf
+  embedding_model: ~/models/bge-m3-Q8_0.gguf
+
+runtimes:
+  chat:
+    driver: llama_cpp
+    gpu: local
+    autoload: false
+    on_demand: false
+    port: 8082
+    slots: 1
+    command: >-
+      {defaults.llama_bin}
+      --model {defaults.chat_model}
+      --host 127.0.0.1 --port {port}
+      --ctx-size 8192 --parallel {slots}
+      --slot-save-path {runtime_kv}
+      --jinja
+
+  # Optional: install the matching GGUF to use this embedding runtime.
+  bge-m3:
+    driver: llama_cpp_embedding
+    gpu: local
+    autoload: false
+    on_demand: false
+    port: 8084
+    slots: 2
+    command: >-
+      {defaults.llama_bin}
+      --model {defaults.embedding_model}
+      --host 127.0.0.1 --port {port}
+      --embedding --pooling cls --parallel {slots}
+      --ctx-size 16384 --batch-size 2048 --ubatch-size 2048
+
+hosts: {}
+routes: {}

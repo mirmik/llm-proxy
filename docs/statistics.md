@@ -1,5 +1,8 @@
 # Usage statistics
 
+View statistics in the control panel or through
+`GET /v1/control/statistics` on the control listener.
+
 `llm-proxy` stores local operational statistics in
 `<state_dir>/statistics.sqlite3`. Statistics are enabled by default and can be
 disabled or relocated in `config.yaml`:

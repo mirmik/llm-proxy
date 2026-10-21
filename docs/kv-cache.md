@@ -1,5 +1,10 @@
 # KV cache persistence
 
+Send a stable `X-LLM-Proxy-Session-ID` header with each chat request to reuse
+the same local session. Keep sending the full conversation so the backend can
+recover when live or saved state is unavailable. Requests without a session ID
+use transient slots.
+
 `llm-proxy` persists llama.cpp slot state for requests that carry a session ID.
 The llama.cpp slot API writes a complete checkpoint, so saving after every
 successful request can rewrite hundreds of megabytes or several gigabytes.

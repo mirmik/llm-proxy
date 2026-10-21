@@ -1,6 +1,7 @@
 # Runtime Architecture
 
-`llm-proxy` is moving toward a single runtime host model.
+`RuntimeManager` owns managed inference processes. Drivers describe how to
+validate, launch, and check each type of runtime.
 
 ## Concepts
 
@@ -23,7 +24,7 @@ Implemented:
 - TTS PCM forwarding, including streaming VoxCPM2 output
 
 Embedding runtime configuration and API behavior are documented in
-`EMBEDDINGS.md`.
+[Embedding runtimes](embeddings.md).
 
 ## Driver Contract
 
@@ -50,7 +51,11 @@ If `venv` is set, `llm-proxy` resolves the interpreter as:
 <venv>/bin/python
 ```
 
-This allows STT, TTS, diffusion, and other runtimes to use different PyTorch builds while still being started and supervised directly by `llm-proxy`.
+This allows speech runtimes to use different PyTorch builds while still being
+started and supervised directly by `llm-proxy`. Install each runner's
+dependencies in its selected environment. When using the faster-whisper
+runner, also install this package into that environment (`python -m pip
+install -e /path/to/llm-proxy`): it imports the shared STT protocol module.
 
 ## CLI Control
 
@@ -58,10 +63,10 @@ The `llm-proxy` command can manage a running proxy through the control port:
 
 ```bash
 llm-proxy status --port 8091
-llm-proxy start qwen3.6-27b --port 8091
-llm-proxy stop qwen3.6-27b --port 8091
-llm-proxy restart qwen3.6-27b --port 8091
-llm-proxy logs qwen3.6-27b -n 120 --port 8091
+llm-proxy start chat --port 8091
+llm-proxy stop chat --port 8091
+llm-proxy restart chat --port 8091
+llm-proxy logs chat -n 120 --port 8091
 llm-proxy routes --port 8091
 llm-proxy cleanup-kv --port 8091
 ```
@@ -97,6 +102,6 @@ GPU memory when explicitly started. A stopped TTS returns 503 without loading.
 `voice` selects the runtime for `/v1/audio/speech`; `/tts/health?voice=NAME`
 checks that specific runtime. Unknown names return 404, not a different voice.
 
-See [TTS.md](TTS.md) for VoxCPM2 setup, PCM format, streaming, and verification.
+See [speech runtimes](speech.md) for setup, PCM formats, and streaming.
 The proxy forwards TTS bytes; synthesis behavior depends on the runner. XTTS
 returns a completed waveform, while VoxCPM2 can return incremental PCM.

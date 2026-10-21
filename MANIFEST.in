@@ -1,0 +1,4 @@
+include CONTRIBUTING.md config.example.yaml install.sh
+recursive-include docs *.md
+recursive-include deploy *.service
+recursive-include tests *.py
