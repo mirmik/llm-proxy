@@ -30,6 +30,7 @@ class RuntimeManager:
         self._processes = {}
         self._logs = {}
         self._meta = {}
+        self._starting = set()
 
     def available_runtimes(self):
         return list(self.runtimes.keys())
@@ -49,6 +50,9 @@ class RuntimeManager:
     def is_running(self, runtime_name):
         proc = self._processes.get(runtime_name)
         return proc is not None and proc.returncode is None
+
+    def is_starting(self, runtime_name):
+        return runtime_name in self._starting
 
     def driver_for(self, runtime_name):
         driver_name = self.runtimes[runtime_name]["driver"]
@@ -150,9 +154,13 @@ class RuntimeManager:
         health_url = driver.resolve_health_url(runtime_name, runtime_cfg, self.config)
         if health_url:
             timeout = float(driver.startup_timeout(runtime_name, runtime_cfg))
-            if not await self._wait_healthy(health_url, timeout=timeout):
-                await self.stop(runtime_name)
-                raise TimeoutError(f"{runtime_name} failed to start within {timeout}s")
+            self._starting.add(runtime_name)
+            try:
+                if not await self._wait_healthy(health_url, timeout=timeout):
+                    await self.stop(runtime_name)
+                    raise TimeoutError(f"{runtime_name} failed to start within {timeout}s")
+            finally:
+                self._starting.discard(runtime_name)
         self._append_log(runtime_name, "[ready]")
         log_event("runtime ready", runtime=runtime_name, ms=elapsed_ms(started), pid=proc.pid)
 

@@ -263,7 +263,7 @@ def _add_session_header(headers, session_id):
 
 
 def create_api_app(runtime_manager, slot_manager, auth_manager=None, route_manager=None):
-    """Public API surface: inference + discovery. Token-gated when auth.enabled."""
+    """Inference and model discovery are token-gated; health/capabilities are public."""
     app = _setup_app(runtime_manager, slot_manager, auth_manager, routes=route_manager)
     app.router.add_post("/stt", handle_stt_proxy)
     app.router.add_get("/stt/health", handle_stt_health)
@@ -273,6 +273,7 @@ def create_api_app(runtime_manager, slot_manager, auth_manager=None, route_manag
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_post("/tokenize", handle_tokenize)
     app.router.add_get("/v1/models", handle_models)
+    app.router.add_get("/v1/models/{name}/health", handle_model_health)
     app.router.add_get("/v1/capabilities", handle_capabilities)
     app.router.add_get("/health", handle_health)
     return app
@@ -1057,6 +1058,7 @@ def _log_proxy_done(op, status, error=None, output_bytes=0):
 
 async def handle_models(request):
     """GET /v1/models — list available and loaded models (local + routed)."""
+    _require_client_auth(request)
     rm = request.app["rm"]
     route_manager = request.app.get("routes")
     models = []
@@ -1146,13 +1148,51 @@ async def handle_unload(request):
 
 
 async def handle_health(request):
-    """GET /health — proxy health."""
+    """GET /health — public proxy liveness, without model information."""
+    return web.json_response({"status": "ok"})
+
+
+async def handle_model_health(request):
+    """Check one exact local runtime without starting it or following routes."""
+    _require_client_auth(request)
     rm = request.app["rm"]
-    return web.json_response({
-        "status": "ok",
-        "loaded_models": rm.loaded_models(),
-        "loaded_runtimes": rm.loaded_runtimes(),
-    })
+    name = request.match_info["name"]
+    if name not in rm.available_runtimes():
+        return web.json_response({"error": "Unknown local model", "model": name}, status=404)
+
+    on_demand = rm.on_demand(name)
+
+    def response(status, *, ready=False, available=False, code=503):
+        return web.json_response({
+            "model": name,
+            "status": status,
+            "ready": ready,
+            "available": available,
+            "on_demand": on_demand,
+        }, status=code)
+
+    if not rm.is_running(name):
+        # Readiness remains false, even when a request could start this model.
+        allow_on_demand = request.query.get("allow_on_demand") == "true"
+        return response(
+            "stopped", available=on_demand,
+            code=200 if allow_on_demand and on_demand else 503,
+        )
+    if rm.is_starting(name):
+        return response("starting")
+
+    driver = rm.driver_for(name)
+    url = driver.resolve_health_url(name, rm.runtime_config(name), rm.config)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=1), allow_redirects=False,
+            ) as upstream:
+                if upstream.status == 200 and rm.is_running(name):
+                    return response("ready", ready=True, available=True, code=200)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+    return response("unavailable")
 
 
 def _resolve_stt_runtime(rm, requested=None):
@@ -1653,14 +1693,13 @@ async def handle_stt_health(request):
     route = _resolve_stt_route(route_manager, requested_runtime)
     if route:
         from llm_proxy.route_manager import (
-            _derive_health_url,
             backend_client_kwargs,
             backend_request_kwargs,
         )
 
         last_err = None
         for backend in route.failover_candidates():
-            url = _derive_health_url(backend["url"], route.health_path)
+            url = route.health_url(backend)
             headers = route._auth_headers(backend)
             try:
                 async with aiohttp.ClientSession(

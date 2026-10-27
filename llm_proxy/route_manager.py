@@ -5,6 +5,7 @@ Adapted from nemor-link's ServicePool (pool.py), made async with aiohttp.
 
 import asyncio
 import time
+from urllib.parse import quote
 
 import aiohttp
 
@@ -143,8 +144,8 @@ class Route:
             self._drop_sessions_for_url_locked(url)
 
     async def probe(self, url, session=None):
-        health_url = _derive_health_url(url, self.health_path)
-        backend = self._by_url.get(url) or {}
+        backend = self._by_url.get(url) or {"url": url}
+        health_url = self.health_url(backend)
         owned_session = session is None
         if owned_session:
             session = aiohttp.ClientSession(**backend_client_kwargs(backend))
@@ -152,10 +153,12 @@ class Route:
         try:
             async with session.get(
                 health_url,
+                headers=self._auth_headers(backend),
                 timeout=aiohttp.ClientTimeout(total=self.health_timeout),
+                allow_redirects=False,
                 **backend_request_kwargs(backend),
             ) as resp:
-                ok = resp.status < 500
+                ok = 200 <= resp.status < 300
                 latency = time.time() - t0
         except Exception:
             ok = False
@@ -165,6 +168,12 @@ class Route:
                 await session.close()
         await self._mark(url, ok, latency)
         return ok, latency
+
+    def health_url(self, backend):
+        """Expand the upstream model name for explicit proxy readiness checks."""
+        model = backend.get("model") or self.name
+        path = self.health_path.replace("{model}", quote(model, safe=""))
+        return _derive_health_url(backend["url"], path)
 
     async def probe_all(self):
         results = []

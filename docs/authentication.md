@@ -35,12 +35,24 @@ The panel's API-auth switch persists to `<state_dir>/api_auth.json` and takes
 precedence over `auth.enabled` in YAML. Check the panel setting if editing the
 config does not change the effective state.
 
+When enabled, API authentication protects inference, tokenization,
+`GET /v1/models`, `GET /v1/models/{name}/health`, `/stt/health`, and `/tts/health`.
+These endpoints require an API bearer token; a control-panel session does not
+authorize them. A missing bearer token returns 401; an invalid or revoked token
+returns 403. When API authentication is disabled, they remain accessible
+without credentials.
+
+`GET /health` and `GET /v1/capabilities` are always public. `/health` returns
+only `{"status":"ok"}`; it no longer includes `loaded_models` or
+`loaded_runtimes`. Use authenticated model discovery or a
+[per-model readiness check](configuration.md#model-readiness) for model state.
+
 ## Control-panel access
 
 The control listener is open until a web password is set. Open the panel over
 loopback and set a password in its settings before exposing control access.
 The password hash is persisted in `<state_dir>/web_password.json`.
-Setting `auth.enabled: true` only protects inference; it does not enable web
+Setting `auth.enabled: true` protects the model API; it does not enable web
 login. The legacy `web_auth.enabled` and `web_auth.users` YAML fields do not
 configure the current password mechanism.
 

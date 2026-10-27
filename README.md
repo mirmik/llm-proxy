@@ -86,10 +86,15 @@ The example exposes inference on port **8090** and control on **8091**.
 | `POST` | `/v1/embeddings` | Dense embeddings |
 | `POST` | `/tokenize` | Backend tokenization; requires backend support |
 | `GET` | `/v1/models` | Chat model discovery |
+| `GET` | `/v1/models/{name}/health` | Readiness of one exact local runtime |
 | `GET` | `/v1/capabilities` | Service and protocol discovery |
-| `GET` | `/health` | Proxy health |
+| `GET` | `/health` | Public proxy liveness, without model details |
 | `POST` | `/stt` | Speech recognition from raw PCM |
 | `POST` | `/v1/audio/speech` | Speech synthesis using the custom PCM contract |
+
+When API authentication is enabled, inference, `/v1/models`, and per-model
+health require a bearer token. `/health` and `/v1/capabilities` remain public.
+See the [readiness and routing contract](docs/configuration.md#model-readiness).
 
 For persistent local chat sessions, send an `X-LLM-Proxy-Session-ID` header.
 See [KV cache persistence](docs/kv-cache.md) for checkpoint behavior and recovery

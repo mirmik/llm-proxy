@@ -72,7 +72,7 @@ hosts:
 routes:
   remote-chat:
     kind: llm
-    health_path: /health
+    health_path: /v1/models/{model}/health?allow_on_demand=true
     check_interval: 5
     session_ttl: 3600
     backends:
@@ -98,14 +98,59 @@ requests try remaining candidates. Background probes refresh health. Once audio
 or response streaming has begun, a failed transfer cannot transparently restart
 on another backend.
 
-Route kinds are `llm`, `embedding`, `stt`, and `tts`. A backend's `/health` must
-be reachable, or `health_path` must be adjusted. A healthy remote proxy does not
-necessarily mean the selected model is loaded; configure remote availability
-and on-demand loading accordingly.
+Route kinds are `llm`, `embedding`, `stt`, and `tts`. The default `health_path`
+is `/health`. For a direct model server, keep its documented readiness path.
+For another llm-proxy, configure `/v1/models/{model}/health` to check the target
+local runtime instead of server liveness. `{model}` is replaced with the
+URL-encoded backend `model`, or the route name if no override is set. Existing
+health paths are preserved; proxy readiness is an explicit configuration choice.
+Add `?allow_on_demand=true` if stopped models with `on_demand: true` should be
+eligible for routing. The check itself never starts a model.
+
+Probes send the configured backend authentication headers and apply its TLS
+settings. Only HTTP 2xx counts as healthy; redirects are not followed. In
+particular, 401, 403, and 404 are failures. Existing routes that check `/health`
+still measure server liveness only; update their `health_path` to check model
+readiness after upgrading the backend proxy. Older proxies without the new
+endpoint return 404 and are not considered ready under that configuration.
 
 Use the Routing tab or `llm-proxy routes` to inspect routes. The control API
 also supports creating/deleting routes and editing their backend lists under
 `/v1/control/routes`.
+
+## Model readiness
+
+`GET /health` is public and returns HTTP 200 with `{"status":"ok"}` when the
+proxy is alive, even if every model is stopped. It no longer returns model or
+runtime lists. `GET /v1/capabilities` remains public discovery metadata.
+
+`GET /v1/models/{name}/health` uses the same API bearer-token requirement as
+inference. The name must exactly match a **local runtime** (LLM, embedding, STT,
+or TTS). Partial names and route-only aliases return 404; the check never
+follows routes or starts a runtime. `/v1/models` remains the chat model catalog;
+its `loaded` status means the process is running, not confirmed readiness.
+
+The readiness response contains `model`, `status`, `ready`, `available`, and
+`on_demand`. `available` indicates readiness or eligibility for on-demand
+startup; it does not reserve capacity or guarantee that startup will succeed.
+
+| State | HTTP | `status` | `ready` | `available` |
+| --- | --- | --- | --- | --- |
+| Backend health returns 200 | 200 | `ready` | true | true |
+| Startup is in progress | 503 | `starting` | false | false |
+| Process is stopped, on-demand disabled | 503 | `stopped` | false | false |
+| Process is stopped, on-demand enabled | 503 | `stopped` | false | true |
+| Process is alive but backend health fails | 503 | `unavailable` | false | false |
+| Unknown local runtime | 404 | Error response | — | — |
+
+Adding `?allow_on_demand=true` changes the stopped/on-demand-enabled response
+to HTTP 200, keeping `status: stopped`, `ready: false`, and `available: true`.
+It does not make a starting or unhealthy running runtime eligible.
+
+For running runtimes, the proxy checks the driver's configured `health_host`
+and `health_path` with a one-second timeout, accepting only HTTP 200 and not
+following redirects. Raw backend responses and internal addresses are not
+included in the result. These checks report backend readiness, not free slots.
 
 ## Timeouts and persistence
 

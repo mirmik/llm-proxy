@@ -54,7 +54,9 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         })
 
     async def test_models_exclude_non_llm_routes(self):
-        response = await handle_models(self.request())
+        request = self.request()
+        request.app["auth"] = None
+        response = await handle_models(request)
         ids = [item["id"] for item in json.loads(response.text)["data"]]
         self.assertEqual(ids, ["local-llm", "remote-llm"])
 

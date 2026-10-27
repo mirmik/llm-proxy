@@ -11,7 +11,8 @@ from llm_proxy.route_manager import (
 
 
 class _DummyResponse:
-    status = 200
+    def __init__(self, status=200):
+        self.status = status
 
     async def __aenter__(self):
         return self
@@ -21,13 +22,14 @@ class _DummyResponse:
 
 
 class _DummyClientSession:
-    def __init__(self):
+    def __init__(self, status=200):
         self.closed = False
         self.requests = []
+        self.status = status
 
     def get(self, url, **kwargs):
         self.requests.append((url, kwargs))
-        return _DummyResponse()
+        return _DummyResponse(self.status)
 
     async def close(self):
         self.closed = True
@@ -64,6 +66,29 @@ class RouteSessionDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(session.closed)
         self.assertEqual(len(session.requests), 2)
         self.assertIs(session.requests[0][1]["ssl"], False)
+
+    async def test_probes_require_success_status_and_do_not_follow_redirects(self):
+        route = Route("model", [{"url": "http://host:8090"}])
+        for code in (200, 204, 301, 302, 401, 403, 404, 429, 500, 503):
+            with self.subTest(code=code):
+                session = _DummyClientSession(status=code)
+                ok, _ = await route.probe("http://host:8090", session=session)
+                self.assertEqual(ok, 200 <= code < 300)
+                self.assertFalse(session.requests[0][1]["allow_redirects"])
+
+    def test_health_path_template_uses_encoded_backend_model_or_route_name(self):
+        route = Route("route-name", [], health_path="/v1/models/{model}/health?allow_on_demand=true")
+        self.assertEqual(route.health_url({"url": "http://host:8090/", "model": "org/model #?"}),
+                         "http://host:8090/v1/models/org%2Fmodel%20%23%3F/health?allow_on_demand=true")
+        self.assertEqual(route.health_url({"url": "http://host:8090"}),
+                         "http://host:8090/v1/models/route-name/health?allow_on_demand=true")
+
+    async def test_explicit_direct_backend_health_path_is_preserved(self):
+        route = Route("model", [{"url": "http://host:8090", "model": "upstream-model"}],
+                      health_path="/custom-ready?check=true")
+        session = _DummyClientSession()
+        await route.probe("http://host:8090", session=session)
+        self.assertEqual(session.requests[0][0], "http://host:8090/custom-ready?check=true")
 
     async def test_monitor_closes_shared_health_session_on_stop(self):
         session = _DummyClientSession()
